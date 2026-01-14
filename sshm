@@ -1,0 +1,163 @@
+#!/bin/bash
+
+# Configuration
+JSON_FILE="./ssh_remote.json"
+
+# Dependency Check
+for cmd in jq sshpass fping; do
+    if ! command -v $cmd &> /dev/null; then
+        [[ "$cmd" == "fping" ]] && continue
+        echo "Error: '$cmd' is not installed."
+        exit 1
+    fi
+done
+
+print_usage() {
+    echo "SSH Manager - Remote Access Tool"
+    echo "--------------------------------"
+    echo "Usage:"
+    echo "  $(basename "$0") [-p] <IP>                 : SSH to IP"
+    echo "  $(basename "$0") [-p] <Name|Num>           : SSH to ServerBMC|Client"
+    echo "  $(basename "$0") [-p] <Name|Num> host<N>   : SSH to ServerHost (NIC)"
+    echo ""
+    echo "Options:"
+    echo "  -p    Perform a ping check before connecting"
+    echo "  -h    Print this help message"
+    echo "  -l    List all nodes"
+}
+
+# Function to ping and then SSH
+do_ssh() {
+    local u=$1 p=$2 i=$3
+    
+    if [[ "$PING_CHECK" == "true" ]]; then
+        echo -n "Pinging $i... "
+        if command -v fping &> /dev/null; then
+            fping -c 1 -t 500 "$i" > /dev/null 2>&1
+        else
+            ping -c 1 -W 1 "$i" > /dev/null 2>&1
+        fi
+
+        if [[ $? -ne 0 ]]; then
+            echo -e "\033[1;31mOFFLINE\033[0m"
+            echo "Error: Target is not reachable. Connection aborted."
+            exit 1
+        else
+            echo -e "\033[1;32mONLINE\033[0m"
+        fi
+    fi
+
+    echo -e "\033[1;32mConnecting to $i ($u)...\033[0m"
+    sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i"
+}
+
+# --- Parse Arguments ---
+PING_CHECK="false"
+ARGS=()
+
+# Process flags first
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p) PING_CHECK="true"; shift ;;
+        -h|help|--help) print_usage; exit 0 ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
+
+# Restore positional parameters (the server name, number, or list command)
+set -- "${ARGS[@]}"
+
+# --- Main Logic ---
+
+# If no parameters left after parsing flags, show help
+if [[ -z "$1" ]]; then
+    print_usage
+    exit 0
+fi
+
+# 1. LIST COMMAND
+if [[ "$1" == "list" || "$1" == "-l" ]]; then
+    # Combine Header and Data into a single stream for 'column'
+    (
+        echo "Num|Type|Name|IP(s)"
+        echo "---|---|---|---"
+        jq -r 'to_entries | .[] | 
+            if .value.type == "client" then
+                "\(.key + 1)|Client|\(.value.name)|\(.value.ip)"
+            else
+                "\(.key + 1)|Server|\(.value.name)|BMC: \(.value.bmc.ip), Hosts: \(.value.hosts | map(.ip) | join(","))"
+            end
+        ' "$JSON_FILE"
+    ) | column -t -s '|'
+    exit 0
+fi
+
+# 2. SINGLE PARAMETER (Number, IP, or Name)
+if [[ $# -eq 1 ]]; then
+    input="$1"
+
+    # A. Number
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        idx=$((input - 1))
+        node=$(jq ".[$idx]" "$JSON_FILE")
+        [[ "$node" == "null" ]] && { echo "Error: Node $input not found."; exit 1; }
+        
+        if [[ $(echo "$node" | jq -r '.type') == "client" ]]; then
+            do_ssh $(echo "$node" | jq -r '.user') $(echo "$node" | jq -r '.pass') $(echo "$node" | jq -r '.ip')
+        else
+            do_ssh $(echo "$node" | jq -r '.bmc.user') $(echo "$node" | jq -r '.bmc.pass') $(echo "$node" | jq -r '.bmc.ip')
+        fi
+        exit 0
+    fi
+
+    # B. IP Search
+    found=$(jq -r --arg ip "$input" '
+        (.[] | select(.type=="client" and .ip==$ip) | {u:.user, p:.pass, i:.ip}) //
+        (.[] | select(.type=="server") | .bmc | select(.ip==$ip) | {u:.user, p:.pass, i:.ip}) //
+        (.[] | select(.type=="server") | .hosts[] | select(.ip==$ip) | {u:.user, p:.pass, i:.ip})
+    ' "$JSON_FILE")
+    if [[ -n "$found" ]]; then
+        do_ssh $(echo "$found" | jq -r .u) $(echo "$found" | jq -r .p) $(echo "$found" | jq -r .i)
+        exit 0
+    fi
+
+    # C. Name
+    node=$(jq -r --arg n "$input" '.[] | select(.name == $n)' "$JSON_FILE")
+    if [[ -n "$node" ]]; then
+        if [[ $(echo "$node" | jq -r '.type') == "client" ]]; then
+            do_ssh $(echo "$node" | jq -r '.user') $(echo "$node" | jq -r '.pass') $(echo "$node" | jq -r '.ip')
+        else
+            do_ssh $(echo "$node" | jq -r '.bmc.user') $(echo "$node" | jq -r '.bmc.pass') $(echo "$node" | jq -r '.bmc.ip')
+        fi
+        exit 0
+    fi
+    echo "Error: Target '$input' not found."
+    exit 1
+fi
+
+# 3. TWO PARAMETERS (Identifier + Target)
+if [[ $# -eq 2 ]]; then
+    identifier="$1"
+    target="$2"
+    
+    if [[ "$identifier" =~ ^[0-9]+$ ]]; then
+        idx=$((identifier - 1))
+        node=$(jq ".[$idx]" "$JSON_FILE")
+    else
+        node=$(jq -r --arg n "$identifier" '.[] | select(.name == $n)' "$JSON_FILE")
+    fi
+
+    [[ "$node" == "null" || -z "$node" ]] && { echo "Error: '$identifier' not found."; exit 1; }
+
+    if [[ "$target" == "bmc" ]]; then
+        do_ssh $(echo "$node" | jq -r '.bmc.user') $(echo "$node" | jq -r '.bmc.pass') $(echo "$node" | jq -r '.bmc.ip')
+    elif [[ "$target" =~ ^host([0-9]+)$ ]]; then
+        idx=$((${BASH_REMATCH[1]} - 1))
+        host_data=$(echo "$node" | jq ".hosts[$idx]")
+        [[ "$host_data" == "null" ]] && { echo "Error: $target not defined."; exit 1; }
+        do_ssh $(echo "$host_data" | jq -r '.user') $(echo "$host_data" | jq -r '.pass') $(echo "$host_data" | jq -r '.ip')
+    else
+        echo "Error: Unknown target '$target'."
+    fi
+    exit 0
+fi

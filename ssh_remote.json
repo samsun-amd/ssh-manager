@@ -1,0 +1,49 @@
+[
+  {
+    "type": "server",
+    "name": "server1",
+    "bmc": {
+      "ip": "x.x.x.x",
+      "user": "root",
+      "pass": "0penBmc"
+    },
+    "hosts": [
+      {
+        "ip": "x.x.x.x",
+        "user": "username",
+        "pass": "password"
+      }
+    ],
+    "note": "Host has 1 NIC"
+  },
+  {
+    "type": "server",
+    "name": "server2",
+    "bmc": {
+      "ip": "x.x.x.x",
+      "user": "root",
+      "pass": "0penBmc"
+    },
+    "hosts": [
+      {
+        "ip": "x.x.x.x",
+        "user": "username",
+        "pass": "password"
+      },
+      {
+        "ip": "x.x.x.x",
+        "user": "username",
+        "pass": "password"
+      }
+    ],
+    "note": "Host has 2 NICs"
+  },
+  {
+    "type": "client",
+    "name": "client",
+    "ip": "x.x.x.x",
+    "user": "username",
+    "pass": "password",
+    "note": "Example client"
+  }
+]
