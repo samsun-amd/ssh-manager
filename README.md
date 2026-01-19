@@ -49,12 +49,13 @@ The inventory supports two node types: server (for machines with BMC and multipl
 SSH Manager - Remote Access Tool
 --------------------------------
 Usage:
-  sshm [-p] <IP>                 : SSH to IP
-  sshm [-p] <Name|Num>           : SSH to ServerBMC|Client
-  sshm [-p] <Name|Num> host<N>   : SSH to ServerHost (NIC)
+  sshm [-p] [-c "command"] <IP>                 : SSH to IP
+  sshm [-p] [-c "command"] <Name|Num>           : SSH to ServerBMC|Client
+  sshm [-p] [-c "command"] <Name|Num> host<N>   : SSH to ServerHost (NIC)
 
 Options:
   -p    Perform a ping check before connecting
+  -c    Execute a remote command instead of opening interactive shell
   -h    Print this help message
   -l    List all nodes
 ```
@@ -62,8 +63,22 @@ Options:
 ### Flags
 -h (Help): Print usage instructions.  
 -l (List Target): Show all servers, indices, and IPs.  
--p (Ping Check): Verify the target is online before attempting SSH.
-Example: sshm -p 1 host1
+-p (Ping Check): Verify the target is online before attempting SSH.  
+-c (Remote Command): Execute a shell command on the target machine and return output.
+
+**Examples:**
+```bash
+# Interactive SSH
+sshm -p 1 host1
+
+# Execute remote command
+sshm -c "uptime" server1
+sshm -c "df -h" 1
+sshm -p -c "free -m" client host1
+
+# Chain remote commands
+sshm -c "uptime && free -m && df -h" server2
+```
 
 ### Example
 
@@ -87,3 +102,67 @@ chmod +x sshm.sh
 3. Configure you own JSON file.
 4. Configure the JSON file path in the script.
 5. Verify: Type sshm -l to ensure it is working correctly.
+
+---
+
+## 🧪 Testing
+
+### Automated QA Testing
+
+The project includes an automated QA test script that validates all functionality.
+
+**Run Tests:**
+```bash
+./sshm_qa_test.sh
+```
+
+**Features:**
+- Automated testing of all core features
+- Color-coded test results (✅ PASS / ❌ FAIL)
+- Auto-generates detailed Markdown test report
+- Comprehensive coverage:
+  - Basic functions (help, list, error handling)
+  - Remote command execution (`-c` flag)
+  - Network connectivity (`-p` ping check)
+  - Edge cases (empty commands, exit codes, special characters)
+
+**Test Output Example:**
+```
+======================================
+  SSH Manager (sshm) QA Test Suite
+======================================
+
+Checking dependencies...
+✓ jq installed
+✓ sshpass installed
+
+=== BASIC FUNCTION TESTS ===
+Running: Help Display
+✅ PASS
+
+Running: List All Nodes
+✅ PASS
+...
+
+======================================
+           TEST SUMMARY
+======================================
+Total Tests: 17
+Passed: 17
+Failed: 0
+Pass Rate: 100.0%
+
+✅ ALL TESTS PASSED!
+```
+
+**Requirements for Testing:**
+- Valid `ssh_remote.json` configuration file
+- Network access to configured hosts
+- Dependencies: `jq`, `sshpass`, `timeout`
+
+**Test Report:**
+After running tests, a detailed report is generated at `sshm_test_report.md` containing:
+- Test execution summary
+- Detailed results for each test case
+- Pass/fail statistics by category
+- Command outputs and validation results
