@@ -16,12 +16,13 @@ print_usage() {
     echo "SSH Manager - Remote Access Tool"
     echo "--------------------------------"
     echo "Usage:"
-    echo "  $(basename "$0") [-p] <IP>                 : SSH to IP"
-    echo "  $(basename "$0") [-p] <Name|Num>           : SSH to ServerBMC|Client"
-    echo "  $(basename "$0") [-p] <Name|Num> host<N>   : SSH to ServerHost (NIC)"
+    echo "  $(basename "$0") [-p] [-c \"command\"] <IP>                 : SSH to IP"
+    echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num>           : SSH to ServerBMC|Client"
+    echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num> host<N>   : SSH to ServerHost (NIC)"
     echo ""
     echo "Options:"
     echo "  -p    Perform a ping check before connecting"
+    echo "  -c    Execute a remote command instead of opening interactive shell"
     echo "  -h    Print this help message"
     echo "  -l    List all nodes"
 }
@@ -47,18 +48,27 @@ do_ssh() {
         fi
     fi
 
-    echo -e "\033[1;32mConnecting to $i ($u)...\033[0m"
-    sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i"
+    if [[ -n "$REMOTE_COMMAND" ]]; then
+        echo -e "\033[1;32mExecuting command on $i ($u): $REMOTE_COMMAND\033[0m"
+        sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i" "$REMOTE_COMMAND"
+        exit $?
+    else
+        echo -e "\033[1;32mConnecting to $i ($u)...\033[0m"
+        sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i"
+    fi
 }
 
 # --- Parse Arguments ---
 PING_CHECK="false"
+REMOTE_COMMAND=""
+REMOTE_COMMAND_SET="false"
 ARGS=()
 
 # Process flags first
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p) PING_CHECK="true"; shift ;;
+        -c) REMOTE_COMMAND="$2"; REMOTE_COMMAND_SET="true"; shift 2 ;;
         -h|help|--help) print_usage; exit 0 ;;
         *) ARGS+=("$1"); shift ;;
     esac
@@ -68,6 +78,12 @@ done
 set -- "${ARGS[@]}"
 
 # --- Main Logic ---
+
+# Check if -c flag was used with empty command
+if [[ "$REMOTE_COMMAND_SET" == "true" && -z "$REMOTE_COMMAND" ]]; then
+    echo "Error: -c flag requires a non-empty command."
+    exit 1
+fi
 
 # If no parameters left after parsing flags, show help
 if [[ -z "$1" ]]; then
