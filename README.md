@@ -52,10 +52,13 @@ Usage:
   sshm [-p] [-c "command"] <IP>                 : SSH to IP
   sshm [-p] [-c "command"] <Name|Num>           : SSH to ServerBMC|Client
   sshm [-p] [-c "command"] <Name|Num> host<N>   : SSH to ServerHost (NIC)
+  sshm -s <source> <dest> <Name|Num>            : SCP file transfer
+  sshm -s <source> <dest> <Name|Num> host<N>    : SCP to ServerHost
 
 Options:
   -p    Perform a ping check before connecting
   -c    Execute a remote command instead of opening interactive shell
+  -s    SCP file transfer mode (requires source and destination)
   -h    Print this help message
   -l    List all nodes
 ```
@@ -64,7 +67,8 @@ Options:
 -h (Help): Print usage instructions.  
 -l (List Target): Show all servers, indices, and IPs.  
 -p (Ping Check): Verify the target is online before attempting SSH.  
--c (Remote Command): Execute a shell command on the target machine and return output.
+-c (Remote Command): Execute a shell command on the target machine and return output.  
+-s (SCP Transfer): Transfer files/directories between local and remote systems.
 
 **Examples:**
 ```bash
@@ -79,6 +83,46 @@ sshm -p -c "free -m" client host1
 # Chain remote commands
 sshm -c "uptime && free -m && df -h" server2
 ```
+
+### SCP File Transfer
+
+The `-s` flag enables secure file transfer (SCP) to and from remote systems.
+
+**Syntax:**
+- Use `remote:` prefix to specify the remote path
+- Works with all target types (number, name, IP, host selection)
+- Automatically handles recursive directory transfers
+
+**Examples:**
+```bash
+# Upload file to remote
+sshm -s local_file.txt remote:/tmp/ 1
+sshm -s config.json remote:/home/user/backup/ server1
+
+# Download file from remote
+sshm -s remote:/var/log/app.log ./ client
+sshm -s remote:/etc/config.json ./backup/ 2
+
+# Upload directory (recursive)
+sshm -s ./local_dir/ remote:/tmp/ server1
+sshm -s ./project/ remote:/home/user/backup/ 1 host1
+
+# Download directory (recursive)
+sshm -s remote:/var/logs/ ./backup/ server2
+sshm -s remote:/home/data/ ./ 3
+
+# Transfer to/from server hosts
+sshm -s data.txt remote:/tmp/ server1 host1
+sshm -s remote:/var/log/syslog ./logs/ server1 host2
+```
+
+**SCP Features:**
+- ✅ Bidirectional transfer (upload & download)
+- ✅ Automatic recursive transfer for directories
+- ✅ Works with all target types (number, name, IP)
+- ✅ Server host support (BMC and individual NICs)
+- ✅ Progress feedback and status messages
+- ✅ Exit code propagation for error handling
 
 ### Example
 
@@ -123,6 +167,7 @@ The project includes an automated QA test script that validates all functionalit
 - Comprehensive coverage:
   - Basic functions (help, list, error handling)
   - Remote command execution (`-c` flag)
+  - SCP file transfer (`-s` flag)
   - Network connectivity (`-p` ping check)
   - Edge cases (empty commands, exit codes, special characters)
 
@@ -147,8 +192,8 @@ Running: List All Nodes
 ======================================
            TEST SUMMARY
 ======================================
-Total Tests: 17
-Passed: 17
+Total Tests: 26
+Passed: 26
 Failed: 0
 Pass Rate: 100.0%
 

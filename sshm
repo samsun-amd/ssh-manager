@@ -19,12 +19,28 @@ print_usage() {
     echo "  $(basename "$0") [-p] [-c \"command\"] <IP>                 : SSH to IP"
     echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num>           : SSH to ServerBMC|Client"
     echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num> host<N>   : SSH to ServerHost (NIC)"
+    echo "  $(basename "$0") -s <source> <dest> <Name|Num>              : SCP file transfer"
+    echo "  $(basename "$0") -s <source> <dest> <Name|Num> host<N>      : SCP to ServerHost"
     echo ""
     echo "Options:"
     echo "  -p    Perform a ping check before connecting"
     echo "  -c    Execute a remote command instead of opening interactive shell"
+    echo "  -s    SCP file transfer mode (requires source and destination)"
     echo "  -h    Print this help message"
     echo "  -l    List all nodes"
+    echo ""
+    echo "SCP Examples:"
+    echo "  # Upload file to remote"
+    echo "  $(basename "$0") -s local_file.txt remote:/path/to/dest/ target"
+    echo ""
+    echo "  # Download file from remote"
+    echo "  $(basename "$0") -s remote:/path/to/file.txt local_dest/ target"
+    echo ""
+    echo "  # Upload directory (recursive)"
+    echo "  $(basename "$0") -s local_dir/ remote:/path/to/dest/ target"
+    echo ""
+    echo "  # Download from server host"
+    echo "  $(basename "$0") -s remote:/path/file.txt ./ server1 host1"
 }
 
 # Function to ping and then SSH
@@ -58,10 +74,76 @@ do_ssh() {
     fi
 }
 
+# Function to perform SCP transfer
+do_scp() {
+    local u=$1 p=$2 i=$3 source="$SCP_SOURCE" dest="$SCP_DEST"
+    
+    # Parse remote: prefix
+    local upload=true
+    local remote_path=""
+    local local_path=""
+    
+    if [[ "$source" == remote:* ]]; then
+        # Download: remote -> local
+        upload=false
+        remote_path="${source#remote:}"
+        local_path="$dest"
+    elif [[ "$dest" == remote:* ]]; then
+        # Upload: local -> remote
+        upload=true
+        remote_path="${dest#remote:}"
+        local_path="$source"
+    else
+        echo "Error: Either source or dest must have 'remote:' prefix"
+        echo "Usage: $(basename "$0") -s <source> <dest> <target>"
+        echo "  Upload:   $(basename "$0") -s local_file remote:/path/ target"
+        echo "  Download: $(basename "$0") -s remote:/path/file ./ target"
+        exit 1
+    fi
+    
+    # Determine if recursive transfer needed
+    local recursive_flag=""
+    if [[ "$upload" == true ]]; then
+        if [[ -d "$local_path" ]]; then
+            recursive_flag="-r"
+        elif [[ ! -e "$local_path" ]]; then
+            echo "Error: Source file/directory '$local_path' does not exist"
+            exit 1
+        fi
+    fi
+    
+    if [[ "$upload" == true ]]; then
+        echo -e "\033[1;32mUploading $local_path -> $u@$i:$remote_path\033[0m"
+        sshpass -p "$p" scp $recursive_flag -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$local_path" "$u@$i:$remote_path"
+    else
+        echo -e "\033[1;32mDownloading $u@$i:$remote_path -> $local_path\033[0m"
+        # Check if remote is directory for recursive download
+        local is_dir=$(sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$u@$i" "[ -d '$remote_path' ] && echo 'yes' || echo 'no'" 2>/dev/null)
+        if [[ "$is_dir" == "yes" ]]; then
+            recursive_flag="-r"
+        fi
+        sshpass -p "$p" scp $recursive_flag -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$u@$i:$remote_path" "$local_path"
+    fi
+    
+    local exit_code=$?
+    if [[ $exit_code -eq 0 ]]; then
+        echo -e "\033[1;32m✓ Transfer completed successfully\033[0m"
+    else
+        echo -e "\033[1;31m✗ Transfer failed with exit code $exit_code\033[0m"
+    fi
+    return $exit_code
+}
+
 # --- Parse Arguments ---
 PING_CHECK="false"
 REMOTE_COMMAND=""
 REMOTE_COMMAND_SET="false"
+SCP_MODE="false"
+SCP_SOURCE=""
+SCP_DEST=""
 ARGS=()
 
 # Process flags first
@@ -69,6 +151,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -p) PING_CHECK="true"; shift ;;
         -c) REMOTE_COMMAND="$2"; REMOTE_COMMAND_SET="true"; shift 2 ;;
+        -s) SCP_MODE="true"; SCP_SOURCE="$2"; SCP_DEST="$3"; shift 3 ;;
         -h|help|--help) print_usage; exit 0 ;;
         *) ARGS+=("$1"); shift ;;
     esac
@@ -83,6 +166,15 @@ set -- "${ARGS[@]}"
 if [[ "$REMOTE_COMMAND_SET" == "true" && -z "$REMOTE_COMMAND" ]]; then
     echo "Error: -c flag requires a non-empty command."
     exit 1
+fi
+
+# Check if -s flag was used with proper arguments
+if [[ "$SCP_MODE" == "true" ]]; then
+    if [[ -z "$SCP_SOURCE" || -z "$SCP_DEST" ]]; then
+        echo "Error: -s flag requires both source and destination arguments."
+        echo "Usage: $(basename "$0") -s <source> <dest> <target>"
+        exit 1
+    fi
 fi
 
 # If no parameters left after parsing flags, show help
@@ -119,9 +211,19 @@ if [[ $# -eq 1 ]]; then
         [[ "$node" == "null" ]] && { echo "Error: Node $input not found."; exit 1; }
         
         if [[ $(echo "$node" | jq -r '.type') == "client" ]]; then
-            do_ssh $(echo "$node" | jq -r '.user') $(echo "$node" | jq -r '.pass') $(echo "$node" | jq -r '.ip')
+            u=$(echo "$node" | jq -r '.user')
+            p=$(echo "$node" | jq -r '.pass')
+            i=$(echo "$node" | jq -r '.ip')
         else
-            do_ssh $(echo "$node" | jq -r '.bmc.user') $(echo "$node" | jq -r '.bmc.pass') $(echo "$node" | jq -r '.bmc.ip')
+            u=$(echo "$node" | jq -r '.bmc.user')
+            p=$(echo "$node" | jq -r '.bmc.pass')
+            i=$(echo "$node" | jq -r '.bmc.ip')
+        fi
+        
+        if [[ "$SCP_MODE" == "true" ]]; then
+            do_scp "$u" "$p" "$i"
+        else
+            do_ssh "$u" "$p" "$i"
         fi
         exit 0
     fi
@@ -133,7 +235,14 @@ if [[ $# -eq 1 ]]; then
         (.[] | select(.type=="server") | .hosts[] | select(.ip==$ip) | {u:.user, p:.pass, i:.ip})
     ' "$JSON_FILE")
     if [[ -n "$found" ]]; then
-        do_ssh $(echo "$found" | jq -r .u) $(echo "$found" | jq -r .p) $(echo "$found" | jq -r .i)
+        u=$(echo "$found" | jq -r .u)
+        p=$(echo "$found" | jq -r .p)
+        i=$(echo "$found" | jq -r .i)
+        if [[ "$SCP_MODE" == "true" ]]; then
+            do_scp "$u" "$p" "$i"
+        else
+            do_ssh "$u" "$p" "$i"
+        fi
         exit 0
     fi
 
@@ -141,9 +250,19 @@ if [[ $# -eq 1 ]]; then
     node=$(jq -r --arg n "$input" '.[] | select(.name == $n)' "$JSON_FILE")
     if [[ -n "$node" ]]; then
         if [[ $(echo "$node" | jq -r '.type') == "client" ]]; then
-            do_ssh $(echo "$node" | jq -r '.user') $(echo "$node" | jq -r '.pass') $(echo "$node" | jq -r '.ip')
+            u=$(echo "$node" | jq -r '.user')
+            p=$(echo "$node" | jq -r '.pass')
+            i=$(echo "$node" | jq -r '.ip')
         else
-            do_ssh $(echo "$node" | jq -r '.bmc.user') $(echo "$node" | jq -r '.bmc.pass') $(echo "$node" | jq -r '.bmc.ip')
+            u=$(echo "$node" | jq -r '.bmc.user')
+            p=$(echo "$node" | jq -r '.bmc.pass')
+            i=$(echo "$node" | jq -r '.bmc.ip')
+        fi
+        
+        if [[ "$SCP_MODE" == "true" ]]; then
+            do_scp "$u" "$p" "$i"
+        else
+            do_ssh "$u" "$p" "$i"
         fi
         exit 0
     fi
@@ -166,12 +285,26 @@ if [[ $# -eq 2 ]]; then
     [[ "$node" == "null" || -z "$node" ]] && { echo "Error: '$identifier' not found."; exit 1; }
 
     if [[ "$target" == "bmc" ]]; then
-        do_ssh $(echo "$node" | jq -r '.bmc.user') $(echo "$node" | jq -r '.bmc.pass') $(echo "$node" | jq -r '.bmc.ip')
+        u=$(echo "$node" | jq -r '.bmc.user')
+        p=$(echo "$node" | jq -r '.bmc.pass')
+        i=$(echo "$node" | jq -r '.bmc.ip')
+        if [[ "$SCP_MODE" == "true" ]]; then
+            do_scp "$u" "$p" "$i"
+        else
+            do_ssh "$u" "$p" "$i"
+        fi
     elif [[ "$target" =~ ^host([0-9]+)$ ]]; then
         idx=$((${BASH_REMATCH[1]} - 1))
         host_data=$(echo "$node" | jq ".hosts[$idx]")
         [[ "$host_data" == "null" ]] && { echo "Error: $target not defined."; exit 1; }
-        do_ssh $(echo "$host_data" | jq -r '.user') $(echo "$host_data" | jq -r '.pass') $(echo "$host_data" | jq -r '.ip')
+        u=$(echo "$host_data" | jq -r '.user')
+        p=$(echo "$host_data" | jq -r '.pass')
+        i=$(echo "$host_data" | jq -r '.ip')
+        if [[ "$SCP_MODE" == "true" ]]; then
+            do_scp "$u" "$p" "$i"
+        else
+            do_ssh "$u" "$p" "$i"
+        fi
     else
         echo "Error: Unknown target '$target'."
     fi
