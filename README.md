@@ -40,6 +40,14 @@ The inventory supports two node types: server (for machines with BMC and multipl
     "user": "username",
     "pass": "mypassword",
     "note": "Local dev box"
+  },
+  {
+    "type": "smc",
+    "name": "SMC_Node",
+    "ip": "x.x.x.x",
+    "user": "root",
+    "pass": "0penBmc",
+    "note": "SMC/HMC accessed via BMC"
   }
 ]
 ```
@@ -52,6 +60,7 @@ Usage:
   sshm [-p] [-c "command"] <IP>                 : SSH to IP
   sshm [-p] [-c "command"] <Name|Num>           : SSH to ServerBMC|Client
   sshm [-p] [-c "command"] <Name|Num> host<N>   : SSH to ServerHost (NIC)
+  sshm [-p] [-c "command"] <Name|Num> smc       : SSH to SMC via BMC
   sshm -s <source> <dest> <Name|Num>            : SCP file transfer
   sshm -s <source> <dest> <Name|Num> host<N>    : SCP to ServerHost
 
@@ -114,6 +123,9 @@ sshm -s remote:/home/data/ ./ 3
 # Transfer to/from server hosts
 sshm -s data.txt remote:/tmp/ server1 host1
 sshm -s remote:/var/log/syslog ./logs/ server1 host2
+
+# Upload to SMC (via BMC)
+sshm -s local_file.txt remote:/tmp/ server1 smc
 ```
 
 **SCP Features:**
@@ -146,68 +158,3 @@ chmod +x sshm.sh
 3. Configure you own JSON file.
 4. Configure the JSON file path in the script.
 5. Verify: Type sshm -l to ensure it is working correctly.
-
----
-
-## 🧪 Testing
-
-### Automated QA Testing
-
-The project includes an automated QA test script that validates all functionality.
-
-**Run Tests:**
-```bash
-./sshm_qa_test.sh
-```
-
-**Features:**
-- Automated testing of all core features
-- Color-coded test results (✅ PASS / ❌ FAIL)
-- Auto-generates detailed Markdown test report
-- Comprehensive coverage:
-  - Basic functions (help, list, error handling)
-  - Remote command execution (`-c` flag)
-  - SCP file transfer (`-s` flag)
-  - Network connectivity (`-p` ping check)
-  - Edge cases (empty commands, exit codes, special characters)
-
-**Test Output Example:**
-```
-======================================
-  SSH Manager (sshm) QA Test Suite
-======================================
-
-Checking dependencies...
-✓ jq installed
-✓ sshpass installed
-
-=== BASIC FUNCTION TESTS ===
-Running: Help Display
-✅ PASS
-
-Running: List All Nodes
-✅ PASS
-...
-
-======================================
-           TEST SUMMARY
-======================================
-Total Tests: 26
-Passed: 26
-Failed: 0
-Pass Rate: 100.0%
-
-✅ ALL TESTS PASSED!
-```
-
-**Requirements for Testing:**
-- Valid `ssh_remote.json` configuration file
-- Network access to configured hosts
-- Dependencies: `jq`, `sshpass`, `timeout`
-
-**Test Report:**
-After running tests, a detailed report is generated at `sshm_test_report.md` containing:
-- Test execution summary
-- Detailed results for each test case
-- Pass/fail statistics by category
-- Command outputs and validation results

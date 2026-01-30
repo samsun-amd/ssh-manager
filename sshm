@@ -19,6 +19,7 @@ print_usage() {
     echo "  $(basename "$0") [-p] [-c \"command\"] <IP>                 : SSH to IP"
     echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num>           : SSH to ServerBMC|Client"
     echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num> host<N>   : SSH to ServerHost (NIC)"
+    echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num> smc       : SSH to SMC via BMC"
     echo "  $(basename "$0") -s <source> <dest> <Name|Num>              : SCP file transfer"
     echo "  $(basename "$0") -s <source> <dest> <Name|Num> host<N>      : SCP to ServerHost"
     echo ""
@@ -41,18 +42,23 @@ print_usage() {
     echo ""
     echo "  # Download from server host"
     echo "  $(basename "$0") -s remote:/path/file.txt ./ server1 host1"
+    echo ""
+    echo "  # Upload to SMC (via BMC)"
+    echo "  $(basename "$0") -s local_file.txt remote:/tmp/ server1 smc"
 }
 
 # Function to ping and then SSH
 do_ssh() {
-    local u=$1 p=$2 i=$3
+    local u=$1 p=$2 i=$3 ju=${4:-} jp=${5:-} ji=${6:-}
     
     if [[ "$PING_CHECK" == "true" ]]; then
-        echo -n "Pinging $i... "
+        local ping_target="$i"
+        [[ -n "$ji" ]] && ping_target="$ji"
+        echo -n "Pinging $ping_target... "
         if command -v fping &> /dev/null; then
-            fping -c 1 -t 500 "$i" > /dev/null 2>&1
+            fping -c 1 -t 500 "$ping_target" > /dev/null 2>&1
         else
-            ping -c 1 -W 1 "$i" > /dev/null 2>&1
+            ping -c 1 -W 1 "$ping_target" > /dev/null 2>&1
         fi
 
         if [[ $? -ne 0 ]]; then
@@ -65,18 +71,33 @@ do_ssh() {
     fi
 
     if [[ -n "$REMOTE_COMMAND" ]]; then
-        echo -e "\033[1;32mExecuting command on $i ($u): $REMOTE_COMMAND\033[0m"
-        sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i" "$REMOTE_COMMAND"
+        if [[ -n "$ji" ]]; then
+            echo -e "\033[1;32mExecuting command on $i ($u) via jump host $ji ($ju): $REMOTE_COMMAND\033[0m"
+            sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o ProxyCommand="sshpass -p '$jp' ssh -W %h:%p -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ju@$ji" \
+                "$u@$i" "$REMOTE_COMMAND"
+        else
+            echo -e "\033[1;32mExecuting command on $i ($u): $REMOTE_COMMAND\033[0m"
+            sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i" "$REMOTE_COMMAND"
+        fi
         exit $?
     else
-        echo -e "\033[1;32mConnecting to $i ($u)...\033[0m"
-        sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i"
+        if [[ -n "$ji" ]]; then
+            echo -e "\033[1;32mConnecting to $i ($u) via jump host $ji ($ju)...\033[0m"
+            sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o ProxyCommand="sshpass -p '$jp' ssh -W %h:%p -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ju@$ji" \
+                "$u@$i"
+        else
+            echo -e "\033[1;32mConnecting to $i ($u)...\033[0m"
+            sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i"
+        fi
     fi
 }
 
 # Function to perform SCP transfer
 do_scp() {
-    local u=$1 p=$2 i=$3 source="$SCP_SOURCE" dest="$SCP_DEST"
+    local u=$1 p=$2 i=$3 ju=${4:-} jp=${5:-} ji=${6:-} 
+    local source="$SCP_SOURCE" dest="$SCP_DEST"
     
     # Parse remote: prefix
     local upload=true
@@ -112,20 +133,49 @@ do_scp() {
         fi
     fi
     
+    # Prepare SCP options
+    local scp_opts=(-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+    if [[ -n "$ji" ]]; then
+        # We can only use "scp -O" in the BMC to SMC
+        scp_opts+=(-O)
+        scp_opts+=(-o "ProxyCommand=sshpass -p '$jp' ssh -W %h:%p -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ju@$ji")
+    fi
+    
     if [[ "$upload" == true ]]; then
-        echo -e "\033[1;32mUploading $local_path -> $u@$i:$remote_path\033[0m"
-        sshpass -p "$p" scp $recursive_flag -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$local_path" "$u@$i:$remote_path"
+        if [[ -n "$ji" ]]; then
+             echo -e "\033[1;32mUploading $local_path -> $u@$i:$remote_path (via $ji)...\033[0m"
+        else
+             echo -e "\033[1;32mUploading $local_path -> $u@$i:$remote_path\033[0m"
+        fi
+        
+        # Construct final command
+        local cmd_flags=("${scp_opts[@]}")
+        [[ -n "$recursive_flag" ]] && cmd_flags+=("$recursive_flag")
+        
+        sshpass -p "$p" scp "${cmd_flags[@]}" "$local_path" "$u@$i:$remote_path"
+
     else
-        echo -e "\033[1;32mDownloading $u@$i:$remote_path -> $local_path\033[0m"
+        if [[ -n "$ji" ]]; then
+             echo -e "\033[1;32mDownloading $u@$i:$remote_path -> $local_path (via $ji)...\033[0m"
+        else
+             echo -e "\033[1;32mDownloading $u@$i:$remote_path -> $local_path\033[0m"
+        fi
+
         # Check if remote is directory for recursive download
-        local is_dir=$(sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$u@$i" "[ -d '$remote_path' ] && echo 'yes' || echo 'no'" 2>/dev/null)
+        local ssh_opts=(-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+        if [[ -n "$ji" ]]; then
+             ssh_opts+=(-o "ProxyCommand=sshpass -p '$jp' ssh -W %h:%p -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ju@$ji")
+        fi
+        
+        local is_dir=$(sshpass -p "$p" ssh "${ssh_opts[@]}" "$u@$i" "[ -d '$remote_path' ] && echo 'yes' || echo 'no'" 2>/dev/null)
         if [[ "$is_dir" == "yes" ]]; then
             recursive_flag="-r"
         fi
-        sshpass -p "$p" scp $recursive_flag -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$u@$i:$remote_path" "$local_path"
+        
+        local cmd_flags=("${scp_opts[@]}")
+        [[ -n "$recursive_flag" ]] && cmd_flags+=("$recursive_flag")
+        
+        sshpass -p "$p" scp "${cmd_flags[@]}" "$u@$i:$remote_path" "$local_path"
     fi
     
     local exit_code=$?
@@ -192,6 +242,8 @@ if [[ "$1" == "list" || "$1" == "-l" ]]; then
         jq -r 'to_entries | .[] | 
             if .value.type == "client" then
                 "\(.key + 1)|Client|\(.value.name)|\(.value.ip)"
+            elif .value.type == "smc" then
+                "\(.key + 1)|SMC|\(.value.name)|\(.value.ip) (via BMC)"
             else
                 "\(.key + 1)|Server|\(.value.name)|BMC: \(.value.bmc.ip), Hosts: \(.value.hosts | map(.ip) | join(","))"
             end
@@ -292,6 +344,33 @@ if [[ $# -eq 2 ]]; then
             do_scp "$u" "$p" "$i"
         else
             do_ssh "$u" "$p" "$i"
+        fi
+    elif [[ "$target" == "smc" ]]; then
+        # Get BMC information as jump host
+        bmc_user=$(echo "$node" | jq -r '.bmc.user')
+        bmc_pass=$(echo "$node" | jq -r '.bmc.pass')
+        bmc_ip=$(echo "$node" | jq -r '.bmc.ip')
+        
+        if [[ "$bmc_user" == "null" || "$bmc_pass" == "null" || "$bmc_ip" == "null" ]]; then
+            echo "Error: '$identifier' is not a server with BMC. SMC requires BMC jump host."
+            exit 1
+        fi
+        
+        # Get SMC information from config
+        smc_node=$(jq -r '.[] | select(.type == "smc")' "$JSON_FILE")
+        if [[ -z "$smc_node" ]]; then
+            echo "Error: No SMC node found in configuration."
+            exit 1
+        fi
+        
+        smc_user=$(echo "$smc_node" | jq -r '.user')
+        smc_pass=$(echo "$smc_node" | jq -r '.pass')
+        smc_ip=$(echo "$smc_node" | jq -r '.ip')
+        
+        if [[ "$SCP_MODE" == "true" ]]; then
+            do_scp "$smc_user" "$smc_pass" "$smc_ip" "$bmc_user" "$bmc_pass" "$bmc_ip"
+        else
+            do_ssh "$smc_user" "$smc_pass" "$smc_ip" "$bmc_user" "$bmc_pass" "$bmc_ip"
         fi
     elif [[ "$target" =~ ^host([0-9]+)$ ]]; then
         idx=$((${BASH_REMATCH[1]} - 1))
