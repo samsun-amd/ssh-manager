@@ -40,6 +40,14 @@ The inventory supports two node types: server (for machines with BMC and multipl
     "user": "username",
     "pass": "mypassword",
     "note": "Local dev box"
+  },
+  {
+    "type": "smc",
+    "name": "SMC_Node",
+    "ip": "192.168.31.1",
+    "user": "admin",
+    "pass": "password",
+    "note": "SMC accessed via BMC"
   }
 ]
 ```
@@ -52,6 +60,7 @@ Usage:
   sshm [-p] [-c "command"] <IP>                 : SSH to IP
   sshm [-p] [-c "command"] <Name|Num>           : SSH to ServerBMC|Client
   sshm [-p] [-c "command"] <Name|Num> host<N>   : SSH to ServerHost (NIC)
+  sshm [-p] [-c "command"] <Name|Num> smc       : SSH to SMC via BMC
   sshm -s <source> <dest> <Name|Num>            : SCP file transfer
   sshm -s <source> <dest> <Name|Num> host<N>    : SCP to ServerHost
 
@@ -114,6 +123,9 @@ sshm -s remote:/home/data/ ./ 3
 # Transfer to/from server hosts
 sshm -s data.txt remote:/tmp/ server1 host1
 sshm -s remote:/var/log/syslog ./logs/ server1 host2
+
+# Upload to SMC (via BMC)
+sshm -s local_file.txt remote:/tmp/ server1 smc
 ```
 
 **SCP Features:**
