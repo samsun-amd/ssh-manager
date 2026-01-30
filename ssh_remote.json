@@ -45,5 +45,13 @@
     "user": "username",
     "pass": "password",
     "note": "Example client"
+  },
+  {
+    "type": "smc",
+    "name": "smc",
+    "ip": "x.x.x.x",
+    "user": "root",
+    "pass": "0penBmc",
+    "note": "SMC and HMC can only ssh from BMC"
   }
 ]
