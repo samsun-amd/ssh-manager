@@ -1,59 +1,84 @@
 # SSH Manager (sshm)
 
-A lightweight Bash utility to manage and automate SSH connections to multiple servers, BMCs, and clients using a JSON-based inventory.
+`sshm` is a lightweight Bash utility for managing SSH, jump-host SSH, and SCP workflows from a JSON inventory.
 
-## 🛠 Prerequisites
+## Requirements
 
-Ensure you have the following tools installed on your system:
+Install the required tools:
 
-bash
-
-```
+```bash
 sudo apt update
 sudo apt install jq sshpass fping -y
 ```
 
-## 📂 Configuration
-The script manages connections based on a JSON file. You need to provide your own JOSN file path, The example here is "./ssh_remote.json"
-### JSON Schema
-The inventory supports two node types: server (for machines with BMC and multiple NICs) and client (for standalone Linux machines).JSON
+`fping` is optional. If it is unavailable, `sshm -p` falls back to `ping`.
+
+## Configuration
+
+The repository `ssh_remote.json` is an example file only. Do not commit real credentials, production IP addresses, or private inventory data.
+
+`sshm` resolves its configuration in this order:
+
+1. `SSHM_CONFIG`, when set.
+2. `$HOME/note/ssh_remote.json`, for deployed local usage.
+3. `ssh_remote.json` in the same directory as the `sshm` script, for repository examples and local development.
+
+Examples:
+
+```bash
+SSHM_CONFIG=/path/to/ssh_remote.json ./sshm -l
+SSHM_CONFIG=/path/to/ssh_remote.json ./sshm -c "hostname" server1
 ```
+
+## JSON Inventory Schema
+
+The inventory supports these node types:
+
+- `server`: a platform with one BMC and optional host NICs.
+- `client`: a standalone SSH target.
+- `smc`: an SMC target that can be accessed through a server BMC jump host.
+
+```json
 [
   {
     "type": "server",
-    "name": "DB_Server_01",
+    "name": "server1",
     "bmc": {
       "ip": "x.x.x.x",
-      "user": "admin",
+      "user": "root",
       "pass": "password"
     },
     "hosts": [
-      { "ip": "x.x.x.x", "user": "root", "pass": "rootpass" },
-      { "ip": "x.x.x.x", "user": "admin", "pass": "adminpass" }
+      {
+        "ip": "x.x.x.x",
+        "user": "root",
+        "pass": "password"
+      }
     ],
-    "note": "Primary Database"
+    "note": "Example server"
   },
   {
     "type": "client",
-    "name": "Dev_Workstation",
+    "name": "client1",
     "ip": "x.x.x.x",
     "user": "username",
-    "pass": "mypassword",
-    "note": "Local dev box"
+    "pass": "password",
+    "note": "Example client"
   },
   {
     "type": "smc",
-    "name": "SMC_Node",
+    "name": "smc",
     "ip": "x.x.x.x",
     "user": "root",
-    "pass": "0penBmc",
-    "note": "SMC/HMC accessed via BMC"
+    "pass": "password",
+    "note": "SMC accessed through a server BMC"
   }
 ]
 ```
-## 📖 Usage
-### Basic Commands
-```
+
+## Usage
+
+```text
 SSH Manager - Remote Access Tool
 --------------------------------
 Usage:
@@ -72,89 +97,78 @@ Options:
   -l    List all nodes
 ```
 
-### Flags
--h (Help): Print usage instructions.  
--l (List Target): Show all servers, indices, and IPs.  
--p (Ping Check): Verify the target is online before attempting SSH.  
--c (Remote Command): Execute a shell command on the target machine and return output.  
--s (SCP Transfer): Transfer files/directories between local and remote systems.
+## Examples
 
-**Examples:**
+Interactive SSH:
+
 ```bash
-# Interactive SSH
 sshm -p 1 host1
-
-# Execute remote command
-sshm -c "uptime" server1
-sshm -c "df -h" 1
-sshm -p -c "free -m" client host1
-
-# Chain remote commands
-sshm -c "uptime && free -m && df -h" server2
+sshm server1 bmc
 ```
 
-### SCP File Transfer
+Remote command execution:
 
-The `-s` flag enables secure file transfer (SCP) to and from remote systems.
-
-**Syntax:**
-- Use `remote:` prefix to specify the remote path
-- Works with all target types (number, name, IP, host selection)
-- Automatically handles recursive directory transfers
-
-**Examples:**
 ```bash
-# Upload file to remote
+sshm -c "uptime" server1
+sshm -c "df -h" 1
+sshm -p -c "free -m" client1
+```
+
+SMC access through a server BMC:
+
+```bash
+sshm server1 smc
+sshm -c "hostname" server1 smc
+```
+
+SCP upload and download:
+
+```bash
 sshm -s local_file.txt remote:/tmp/ 1
-sshm -s config.json remote:/home/user/backup/ server1
-
-# Download file from remote
-sshm -s remote:/var/log/app.log ./ client
-sshm -s remote:/etc/config.json ./backup/ 2
-
-# Upload directory (recursive)
+sshm -s remote:/var/log/app.log ./ client1
 sshm -s ./local_dir/ remote:/tmp/ server1
-sshm -s ./project/ remote:/home/user/backup/ 1 host1
+sshm -s remote:/var/logs/ ./backup/ server1
+```
 
-# Download directory (recursive)
-sshm -s remote:/var/logs/ ./backup/ server2
-sshm -s remote:/home/data/ ./ 3
+SCP through a server host or SMC path:
 
-# Transfer to/from server hosts
+```bash
 sshm -s data.txt remote:/tmp/ server1 host1
-sshm -s remote:/var/log/syslog ./logs/ server1 host2
-
-# Upload to SMC (via BMC)
+sshm -s remote:/var/log/syslog ./logs/ server1 host1
 sshm -s local_file.txt remote:/tmp/ server1 smc
 ```
 
-**SCP Features:**
-- ✅ Bidirectional transfer (upload & download)
-- ✅ Automatic recursive transfer for directories
-- ✅ Works with all target types (number, name, IP)
-- ✅ Server host support (BMC and individual NICs)
-- ✅ Progress feedback and status messages
-- ✅ Exit code propagation for error handling
+## Error Handling
 
-### Example
+`sshm` leaves SSH and SCP diagnostics visible and adds a concise summary for common transport failures.
 
-- List all node
-```
-➜  ssh-manager git:(main) ✗ ./sshm -l
-Num  Type    Name     IP(s)
----  ---     ---      ---
-1    Server  server1  BMC: x.x.x.x, Hosts: x.x.x.x
-2    Server  server2  BMC: x.x.x.x, Hosts: x.x.x.x,x.x.x.x
-3    Client  client   x.x.x.x
+Typical failures include:
+
+- Authentication failures caused by an incorrect username or password.
+- Unreachable hosts or refused connections.
+- Invalid node numbers, invalid host numbers, unknown targets, or missing arguments.
+- Missing or unreadable config files.
+
+Remote command exit codes are preserved. For example, `sshm -c "exit 42" client1` exits with code `42`.
+
+## Installation
+
+Install the script:
+
+```bash
+sudo install -m 0755 sshm /usr/local/bin/sshm
 ```
 
-## 🔧 Installation
-1. Clone the sshm.sh.
-2. Change the mod of the script:
-Bash
+Create a private inventory outside the repository:
+
+```bash
+mkdir -p "$HOME/note"
+cp ssh_remote.json "$HOME/note/ssh_remote.json"
+chmod 600 "$HOME/note/ssh_remote.json"
 ```
-chmod +x sshm.sh
+
+Verify the installation:
+
+```bash
+sshm -l
 ```
-3. Configure you own JSON file.
-4. Configure the JSON file path in the script.
-5. Verify: Type sshm -l to ensure it is working correctly.

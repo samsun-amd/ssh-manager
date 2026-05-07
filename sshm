@@ -1,16 +1,136 @@
 #!/bin/bash
 
 # Configuration
-JSON_FILE="./ssh_remote.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_PRIVATE_CONFIG="$HOME/note/ssh_remote.json"
+EXAMPLE_CONFIG="$SCRIPT_DIR/ssh_remote.json"
+
+if [[ -n "${SSHM_CONFIG:-}" ]]; then
+    JSON_FILE="$SSHM_CONFIG"
+elif [[ -r "$DEFAULT_PRIVATE_CONFIG" ]]; then
+    JSON_FILE="$DEFAULT_PRIVATE_CONFIG"
+else
+    JSON_FILE="$EXAMPLE_CONFIG"
+fi
 
 # Dependency Check
-for cmd in jq sshpass fping; do
-    if ! command -v $cmd &> /dev/null; then
-        [[ "$cmd" == "fping" ]] && continue
+for cmd in jq sshpass; do
+    if ! command -v "$cmd" &> /dev/null; then
         echo "Error: '$cmd' is not installed."
         exit 1
     fi
 done
+
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+NC='\033[0m'
+
+print_error() {
+    echo -e "${RED}Error: $*${NC}" >&2
+}
+
+shell_quote() {
+    printf "%q" "$1"
+}
+
+validate_config() {
+    if [[ ! -f "$JSON_FILE" ]]; then
+        print_error "Config file not found: $JSON_FILE"
+        echo "Set SSHM_CONFIG=/path/to/ssh_remote.json or create $DEFAULT_PRIVATE_CONFIG." >&2
+        exit 1
+    fi
+
+    if [[ ! -r "$JSON_FILE" ]]; then
+        print_error "Config file is not readable: $JSON_FILE"
+        exit 1
+    fi
+
+    if ! jq -e 'type == "array"' "$JSON_FILE" > /dev/null; then
+        print_error "Config file must be a valid JSON array: $JSON_FILE"
+        exit 1
+    fi
+}
+
+build_proxy_command() {
+    local ju=$1 jp=$2 ji=$3
+    printf "sshpass -p %q ssh -W %%h:%%p -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR %q@%q" \
+        "$jp" "$ju" "$ji"
+}
+
+stderr_matches() {
+    local file=$1 pattern=$2
+    [[ -f "$file" ]] && grep -Eqi "$pattern" "$file"
+}
+
+report_ssh_failure() {
+    local exit_code=$1 user=$2 ip=$3 err_file=$4 action=$5
+
+    [[ $exit_code -eq 0 ]] && return 1
+
+    if stderr_matches "$err_file" "Permission denied|Authentication failed|invalid/incorrect password"; then
+        print_error "SSH authentication failed for $user@$ip during $action. Check username/password."
+        return 0
+    fi
+
+    if [[ $exit_code -eq 255 ]] || stderr_matches "$err_file" "Could not resolve hostname|Name or service not known|Connection refused|No route to host|Connection timed out|Operation timed out|Connection closed|Connection reset|Network is unreachable|Host key verification failed|kex_exchange_identification"; then
+        print_error "SSH connection failed for $user@$ip during $action."
+        return 0
+    fi
+
+    return 1
+}
+
+make_error_file() {
+    mktemp "${TMPDIR:-/tmp}/sshm_error.XXXXXX"
+}
+
+cleanup_error_file() {
+    local err_file=$1
+    [[ -n "$err_file" && -f "$err_file" ]] && rm -f "$err_file"
+}
+
+validate_connection_fields() {
+    local label=$1 user=$2 password=$3 ip=$4
+
+    if [[ -z "$user" || "$user" == "null" || -z "$password" || "$password" == "null" || -z "$ip" || "$ip" == "null" ]]; then
+        print_error "Incomplete connection config for $label."
+        return 1
+    fi
+
+    return 0
+}
+
+load_default_connection() {
+    local node=$1 label=$2 node_type
+
+    node_type=$(echo "$node" | jq -r '.type // empty')
+    case "$node_type" in
+        client|smc)
+            TARGET_USER=$(echo "$node" | jq -r '.user // empty')
+            TARGET_PASS=$(echo "$node" | jq -r '.pass // empty')
+            TARGET_IP=$(echo "$node" | jq -r '.ip // empty')
+            ;;
+        server)
+            TARGET_USER=$(echo "$node" | jq -r '.bmc.user // empty')
+            TARGET_PASS=$(echo "$node" | jq -r '.bmc.pass // empty')
+            TARGET_IP=$(echo "$node" | jq -r '.bmc.ip // empty')
+            ;;
+        *)
+            print_error "Unsupported node type '$node_type' for $label."
+            return 1
+            ;;
+    esac
+
+    validate_connection_fields "$label" "$TARGET_USER" "$TARGET_PASS" "$TARGET_IP"
+}
+
+run_selected_action() {
+    if [[ "$SCP_MODE" == "true" ]]; then
+        do_scp "$@"
+    else
+        do_ssh "$@"
+    fi
+}
 
 print_usage() {
     echo "SSH Manager - Remote Access Tool"
@@ -20,8 +140,8 @@ print_usage() {
     echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num>           : SSH to ServerBMC|Client"
     echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num> host<N>   : SSH to ServerHost (NIC)"
     echo "  $(basename "$0") [-p] [-c \"command\"] <Name|Num> smc       : SSH to SMC via BMC"
-    echo "  $(basename "$0") -s <source> <dest> <Name|Num>              : SCP file transfer"
-    echo "  $(basename "$0") -s <source> <dest> <Name|Num> host<N>      : SCP to ServerHost"
+    echo "  $(basename "$0") -s <source> <dest> <Name|Num>            : SCP file transfer"
+    echo "  $(basename "$0") -s <source> <dest> <Name|Num> host<N>    : SCP to ServerHost"
     echo ""
     echo "Options:"
     echo "  -p    Perform a ping check before connecting"
@@ -29,6 +149,9 @@ print_usage() {
     echo "  -s    SCP file transfer mode (requires source and destination)"
     echo "  -h    Print this help message"
     echo "  -l    List all nodes"
+    echo ""
+    echo "Environment:"
+    echo "  SSHM_CONFIG    Override the JSON inventory path"
     echo ""
     echo "SCP Examples:"
     echo "  # Upload file to remote"
@@ -50,47 +173,68 @@ print_usage() {
 # Function to ping and then SSH
 do_ssh() {
     local u=$1 p=$2 i=$3 ju=${4:-} jp=${5:-} ji=${6:-}
-    
+
     if [[ "$PING_CHECK" == "true" ]]; then
         local ping_target="$i"
         [[ -n "$ji" ]] && ping_target="$ji"
         echo -n "Pinging $ping_target... "
         if command -v fping &> /dev/null; then
-            fping -c 1 -t 500 "$ping_target" > /dev/null 2>&1
+            if ! fping -c 1 -t 500 "$ping_target" > /dev/null 2>&1; then
+                echo -e "${RED}OFFLINE${NC}"
+                print_error "Target is not reachable. Connection aborted."
+                exit 1
+            fi
         else
-            ping -c 1 -W 1 "$ping_target" > /dev/null 2>&1
+            if ! ping -c 1 -W 1 "$ping_target" > /dev/null 2>&1; then
+                echo -e "${RED}OFFLINE${NC}"
+                print_error "Target is not reachable. Connection aborted."
+                exit 1
+            fi
         fi
 
-        if [[ $? -ne 0 ]]; then
-            echo -e "\033[1;31mOFFLINE\033[0m"
-            echo "Error: Target is not reachable. Connection aborted."
-            exit 1
-        else
-            echo -e "\033[1;32mONLINE\033[0m"
-        fi
+        echo -e "${GREEN}ONLINE${NC}"
     fi
+
+    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+    if [[ -n "$ji" ]]; then
+        ssh_opts+=(-o "ProxyCommand=$(build_proxy_command "$ju" "$jp" "$ji")")
+    fi
+
+    local err_file exit_code
+    err_file=$(make_error_file) || err_file=""
 
     if [[ -n "$REMOTE_COMMAND" ]]; then
         if [[ -n "$ji" ]]; then
-            echo -e "\033[1;32mExecuting command on $i ($u) via jump host $ji ($ju): $REMOTE_COMMAND\033[0m"
-            sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -o ProxyCommand="sshpass -p '$jp' ssh -W %h:%p -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ju@$ji" \
-                "$u@$i" "$REMOTE_COMMAND"
+            echo -e "${GREEN}Executing command on $i ($u) via jump host $ji ($ju): $REMOTE_COMMAND${NC}"
         else
-            echo -e "\033[1;32mExecuting command on $i ($u): $REMOTE_COMMAND\033[0m"
-            sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i" "$REMOTE_COMMAND"
+            echo -e "${GREEN}Executing command on $i ($u): $REMOTE_COMMAND${NC}"
         fi
-        exit $?
+
+        if [[ -n "$err_file" ]]; then
+            sshpass -p "$p" ssh "${ssh_opts[@]}" "$u@$i" "$REMOTE_COMMAND" 2> >(tee "$err_file" >&2)
+        else
+            sshpass -p "$p" ssh "${ssh_opts[@]}" "$u@$i" "$REMOTE_COMMAND"
+        fi
+        exit_code=$?
+        report_ssh_failure "$exit_code" "$u" "$i" "$err_file" "command execution" || true
+        cleanup_error_file "$err_file"
+        exit "$exit_code"
     else
         if [[ -n "$ji" ]]; then
-            echo -e "\033[1;32mConnecting to $i ($u) via jump host $ji ($ju)...\033[0m"
-            sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -o ProxyCommand="sshpass -p '$jp' ssh -W %h:%p -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ju@$ji" \
-                "$u@$i"
+            echo -e "${GREEN}Connecting to $i ($u) via jump host $ji ($ju)...${NC}"
         else
-            echo -e "\033[1;32mConnecting to $i ($u)...\033[0m"
-            sshpass -p "$p" ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$u@$i"
+            echo -e "${GREEN}Connecting to $i ($u)...${NC}"
         fi
+
+        if [[ -n "$err_file" ]]; then
+            sshpass -p "$p" ssh "${ssh_opts[@]}" "$u@$i" 2> >(tee "$err_file" >&2)
+        else
+            sshpass -p "$p" ssh "${ssh_opts[@]}" "$u@$i"
+        fi
+        exit_code=$?
+        report_ssh_failure "$exit_code" "$u" "$i" "$err_file" "interactive session" || true
+        cleanup_error_file "$err_file"
+        exit "$exit_code"
     fi
 }
 
@@ -115,7 +259,7 @@ do_scp() {
         remote_path="${dest#remote:}"
         local_path="$source"
     else
-        echo "Error: Either source or dest must have 'remote:' prefix"
+        print_error "Either source or dest must have 'remote:' prefix."
         echo "Usage: $(basename "$0") -s <source> <dest> <target>"
         echo "  Upload:   $(basename "$0") -s local_file remote:/path/ target"
         echo "  Download: $(basename "$0") -s remote:/path/file ./ target"
@@ -128,62 +272,90 @@ do_scp() {
         if [[ -d "$local_path" ]]; then
             recursive_flag="-r"
         elif [[ ! -e "$local_path" ]]; then
-            echo "Error: Source file/directory '$local_path' does not exist"
+            print_error "Source file/directory '$local_path' does not exist."
             exit 1
         fi
     fi
     
     # Prepare SCP options
-    local scp_opts=(-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+    local scp_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
     if [[ -n "$ji" ]]; then
         # We can only use "scp -O" in the BMC to SMC
         scp_opts+=(-O)
-        scp_opts+=(-o "ProxyCommand=sshpass -p '$jp' ssh -W %h:%p -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ju@$ji")
+        scp_opts+=(-o "ProxyCommand=$(build_proxy_command "$ju" "$jp" "$ji")")
     fi
     
+    local err_file exit_code
+    err_file=$(make_error_file) || err_file=""
+
     if [[ "$upload" == true ]]; then
         if [[ -n "$ji" ]]; then
-             echo -e "\033[1;32mUploading $local_path -> $u@$i:$remote_path (via $ji)...\033[0m"
+             echo -e "${GREEN}Uploading $local_path -> $u@$i:$remote_path (via $ji)...${NC}"
         else
-             echo -e "\033[1;32mUploading $local_path -> $u@$i:$remote_path\033[0m"
+             echo -e "${GREEN}Uploading $local_path -> $u@$i:$remote_path${NC}"
         fi
         
         # Construct final command
         local cmd_flags=("${scp_opts[@]}")
         [[ -n "$recursive_flag" ]] && cmd_flags+=("$recursive_flag")
         
-        sshpass -p "$p" scp "${cmd_flags[@]}" "$local_path" "$u@$i:$remote_path"
+        if [[ -n "$err_file" ]]; then
+            sshpass -p "$p" scp "${cmd_flags[@]}" "$local_path" "$u@$i:$remote_path" 2> >(tee "$err_file" >&2)
+        else
+            sshpass -p "$p" scp "${cmd_flags[@]}" "$local_path" "$u@$i:$remote_path"
+        fi
 
     else
         if [[ -n "$ji" ]]; then
-             echo -e "\033[1;32mDownloading $u@$i:$remote_path -> $local_path (via $ji)...\033[0m"
+             echo -e "${GREEN}Downloading $u@$i:$remote_path -> $local_path (via $ji)...${NC}"
         else
-             echo -e "\033[1;32mDownloading $u@$i:$remote_path -> $local_path\033[0m"
+             echo -e "${GREEN}Downloading $u@$i:$remote_path -> $local_path${NC}"
         fi
 
         # Check if remote is directory for recursive download
-        local ssh_opts=(-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+        local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
         if [[ -n "$ji" ]]; then
-             ssh_opts+=(-o "ProxyCommand=sshpass -p '$jp' ssh -W %h:%p -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $ju@$ji")
+             ssh_opts+=(-o "ProxyCommand=$(build_proxy_command "$ju" "$jp" "$ji")")
         fi
-        
-        local is_dir=$(sshpass -p "$p" ssh "${ssh_opts[@]}" "$u@$i" "[ -d '$remote_path' ] && echo 'yes' || echo 'no'" 2>/dev/null)
-        if [[ "$is_dir" == "yes" ]]; then
+
+        local probe_err_file probe_exit quoted_remote_path
+        probe_err_file=$(make_error_file) || probe_err_file=""
+        quoted_remote_path=$(shell_quote "$remote_path")
+        if [[ -n "$probe_err_file" ]]; then
+            sshpass -p "$p" ssh "${ssh_opts[@]}" "$u@$i" "test -d $quoted_remote_path" 2> >(tee "$probe_err_file" >&2)
+        else
+            sshpass -p "$p" ssh "${ssh_opts[@]}" "$u@$i" "test -d $quoted_remote_path"
+        fi
+        probe_exit=$?
+        if [[ $probe_exit -eq 0 ]]; then
             recursive_flag="-r"
+        elif [[ $probe_exit -ne 1 ]]; then
+            report_ssh_failure "$probe_exit" "$u" "$i" "$probe_err_file" "remote path probe" || \
+                print_error "Unable to probe remote path '$remote_path' for $u@$i. Exit code: $probe_exit."
+            cleanup_error_file "$probe_err_file"
+            cleanup_error_file "$err_file"
+            return "$probe_exit"
         fi
-        
+        cleanup_error_file "$probe_err_file"
+
         local cmd_flags=("${scp_opts[@]}")
         [[ -n "$recursive_flag" ]] && cmd_flags+=("$recursive_flag")
         
-        sshpass -p "$p" scp "${cmd_flags[@]}" "$u@$i:$remote_path" "$local_path"
+        if [[ -n "$err_file" ]]; then
+            sshpass -p "$p" scp "${cmd_flags[@]}" "$u@$i:$remote_path" "$local_path" 2> >(tee "$err_file" >&2)
+        else
+            sshpass -p "$p" scp "${cmd_flags[@]}" "$u@$i:$remote_path" "$local_path"
+        fi
     fi
     
-    local exit_code=$?
+    exit_code=$?
     if [[ $exit_code -eq 0 ]]; then
-        echo -e "\033[1;32m✓ Transfer completed successfully\033[0m"
+        echo -e "${GREEN}Transfer completed successfully${NC}"
     else
-        echo -e "\033[1;31m✗ Transfer failed with exit code $exit_code\033[0m"
+        report_ssh_failure "$exit_code" "$u" "$i" "$err_file" "SCP transfer" || \
+            print_error "SCP transfer failed with exit code $exit_code."
     fi
+    cleanup_error_file "$err_file"
     return $exit_code
 }
 
@@ -200,9 +372,33 @@ ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p) PING_CHECK="true"; shift ;;
-        -c) REMOTE_COMMAND="$2"; REMOTE_COMMAND_SET="true"; shift 2 ;;
-        -s) SCP_MODE="true"; SCP_SOURCE="$2"; SCP_DEST="$3"; shift 3 ;;
+        -l|list|--list) ARGS+=("$1"); shift ;;
+        -c)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                print_error "-c flag requires a non-empty command."
+                exit 1
+            fi
+            REMOTE_COMMAND="$2"
+            REMOTE_COMMAND_SET="true"
+            shift 2
+            ;;
+        -s)
+            if [[ $# -lt 3 || -z "${2:-}" || -z "${3:-}" ]]; then
+                print_error "-s flag requires both source and destination arguments."
+                echo "Usage: $(basename "$0") -s <source> <dest> <target>" >&2
+                exit 1
+            fi
+            SCP_MODE="true"
+            SCP_SOURCE="$2"
+            SCP_DEST="$3"
+            shift 3
+            ;;
         -h|help|--help) print_usage; exit 0 ;;
+        -*)
+            print_error "Unknown option '$1'."
+            print_usage
+            exit 1
+            ;;
         *) ARGS+=("$1"); shift ;;
     esac
 done
@@ -212,29 +408,26 @@ set -- "${ARGS[@]}"
 
 # --- Main Logic ---
 
-# Check if -c flag was used with empty command
-if [[ "$REMOTE_COMMAND_SET" == "true" && -z "$REMOTE_COMMAND" ]]; then
-    echo "Error: -c flag requires a non-empty command."
-    exit 1
-fi
-
-# Check if -s flag was used with proper arguments
-if [[ "$SCP_MODE" == "true" ]]; then
-    if [[ -z "$SCP_SOURCE" || -z "$SCP_DEST" ]]; then
-        echo "Error: -s flag requires both source and destination arguments."
-        echo "Usage: $(basename "$0") -s <source> <dest> <target>"
-        exit 1
-    fi
-fi
-
 # If no parameters left after parsing flags, show help
 if [[ -z "$1" ]]; then
+    if [[ "$REMOTE_COMMAND_SET" == "true" || "$SCP_MODE" == "true" ]]; then
+        print_error "A target is required."
+        print_usage
+        exit 1
+    fi
     print_usage
     exit 0
 fi
 
+validate_config
+
 # 1. LIST COMMAND
-if [[ "$1" == "list" || "$1" == "-l" ]]; then
+if [[ "$1" == "list" || "$1" == "-l" || "$1" == "--list" ]]; then
+    if [[ $# -ne 1 ]]; then
+        print_error "List command does not accept additional arguments."
+        exit 1
+    fi
+
     # Combine Header and Data into a single stream for 'column'
     (
         echo "Num|Type|Name|IP(s)"
@@ -244,8 +437,10 @@ if [[ "$1" == "list" || "$1" == "-l" ]]; then
                 "\(.key + 1)|Client|\(.value.name)|\(.value.ip)"
             elif .value.type == "smc" then
                 "\(.key + 1)|SMC|\(.value.name)|\(.value.ip) (via BMC)"
+            elif .value.type == "server" then
+                "\(.key + 1)|Server|\(.value.name)|BMC: \(.value.bmc.ip), Hosts: \((.value.hosts // []) | map(.ip) | join(","))"
             else
-                "\(.key + 1)|Server|\(.value.name)|BMC: \(.value.bmc.ip), Hosts: \(.value.hosts | map(.ip) | join(","))"
+                "\(.key + 1)|Unknown|\(.value.name // "unnamed")|Unsupported node type"
             end
         ' "$JSON_FILE"
     ) | column -t -s '|'
@@ -258,67 +453,43 @@ if [[ $# -eq 1 ]]; then
 
     # A. Number
     if [[ "$input" =~ ^[0-9]+$ ]]; then
-        idx=$((input - 1))
+        if (( 10#$input < 1 )); then
+            print_error "Node number must be greater than 0."
+            exit 1
+        fi
+        idx=$((10#$input - 1))
         node=$(jq ".[$idx]" "$JSON_FILE")
-        [[ "$node" == "null" ]] && { echo "Error: Node $input not found."; exit 1; }
-        
-        if [[ $(echo "$node" | jq -r '.type') == "client" ]]; then
-            u=$(echo "$node" | jq -r '.user')
-            p=$(echo "$node" | jq -r '.pass')
-            i=$(echo "$node" | jq -r '.ip')
-        else
-            u=$(echo "$node" | jq -r '.bmc.user')
-            p=$(echo "$node" | jq -r '.bmc.pass')
-            i=$(echo "$node" | jq -r '.bmc.ip')
-        fi
-        
-        if [[ "$SCP_MODE" == "true" ]]; then
-            do_scp "$u" "$p" "$i"
-        else
-            do_ssh "$u" "$p" "$i"
-        fi
+        [[ "$node" == "null" ]] && { print_error "Node $input not found."; exit 1; }
+
+        load_default_connection "$node" "node $input" || exit 1
+        run_selected_action "$TARGET_USER" "$TARGET_PASS" "$TARGET_IP"
         exit 0
     fi
 
     # B. IP Search
     found=$(jq -r --arg ip "$input" '
         (.[] | select(.type=="client" and .ip==$ip) | {u:.user, p:.pass, i:.ip}) //
+        (.[] | select(.type=="smc" and .ip==$ip) | {u:.user, p:.pass, i:.ip}) //
         (.[] | select(.type=="server") | .bmc | select(.ip==$ip) | {u:.user, p:.pass, i:.ip}) //
-        (.[] | select(.type=="server") | .hosts[] | select(.ip==$ip) | {u:.user, p:.pass, i:.ip})
+        (.[] | select(.type=="server") | .hosts[]? | select(.ip==$ip) | {u:.user, p:.pass, i:.ip})
     ' "$JSON_FILE")
     if [[ -n "$found" ]]; then
         u=$(echo "$found" | jq -r .u)
         p=$(echo "$found" | jq -r .p)
         i=$(echo "$found" | jq -r .i)
-        if [[ "$SCP_MODE" == "true" ]]; then
-            do_scp "$u" "$p" "$i"
-        else
-            do_ssh "$u" "$p" "$i"
-        fi
+        validate_connection_fields "$input" "$u" "$p" "$i" || exit 1
+        run_selected_action "$u" "$p" "$i"
         exit 0
     fi
 
     # C. Name
     node=$(jq -r --arg n "$input" '.[] | select(.name == $n)' "$JSON_FILE")
     if [[ -n "$node" ]]; then
-        if [[ $(echo "$node" | jq -r '.type') == "client" ]]; then
-            u=$(echo "$node" | jq -r '.user')
-            p=$(echo "$node" | jq -r '.pass')
-            i=$(echo "$node" | jq -r '.ip')
-        else
-            u=$(echo "$node" | jq -r '.bmc.user')
-            p=$(echo "$node" | jq -r '.bmc.pass')
-            i=$(echo "$node" | jq -r '.bmc.ip')
-        fi
-        
-        if [[ "$SCP_MODE" == "true" ]]; then
-            do_scp "$u" "$p" "$i"
-        else
-            do_ssh "$u" "$p" "$i"
-        fi
+        load_default_connection "$node" "$input" || exit 1
+        run_selected_action "$TARGET_USER" "$TARGET_PASS" "$TARGET_IP"
         exit 0
     fi
-    echo "Error: Target '$input' not found."
+    print_error "Target '$input' not found."
     exit 1
 fi
 
@@ -328,64 +499,68 @@ if [[ $# -eq 2 ]]; then
     target="$2"
     
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then
-        idx=$((identifier - 1))
+        if (( 10#$identifier < 1 )); then
+            print_error "Node number must be greater than 0."
+            exit 1
+        fi
+        idx=$((10#$identifier - 1))
         node=$(jq ".[$idx]" "$JSON_FILE")
     else
         node=$(jq -r --arg n "$identifier" '.[] | select(.name == $n)' "$JSON_FILE")
     fi
 
-    [[ "$node" == "null" || -z "$node" ]] && { echo "Error: '$identifier' not found."; exit 1; }
+    [[ "$node" == "null" || -z "$node" ]] && { print_error "'$identifier' not found."; exit 1; }
 
     if [[ "$target" == "bmc" ]]; then
         u=$(echo "$node" | jq -r '.bmc.user')
         p=$(echo "$node" | jq -r '.bmc.pass')
         i=$(echo "$node" | jq -r '.bmc.ip')
-        if [[ "$SCP_MODE" == "true" ]]; then
-            do_scp "$u" "$p" "$i"
-        else
-            do_ssh "$u" "$p" "$i"
-        fi
+        validate_connection_fields "$identifier bmc" "$u" "$p" "$i" || exit 1
+        run_selected_action "$u" "$p" "$i"
     elif [[ "$target" == "smc" ]]; then
         # Get BMC information as jump host
         bmc_user=$(echo "$node" | jq -r '.bmc.user')
         bmc_pass=$(echo "$node" | jq -r '.bmc.pass')
         bmc_ip=$(echo "$node" | jq -r '.bmc.ip')
         
-        if [[ "$bmc_user" == "null" || "$bmc_pass" == "null" || "$bmc_ip" == "null" ]]; then
-            echo "Error: '$identifier' is not a server with BMC. SMC requires BMC jump host."
+        if ! validate_connection_fields "$identifier BMC jump host" "$bmc_user" "$bmc_pass" "$bmc_ip"; then
+            print_error "'$identifier' is not a server with BMC. SMC requires a BMC jump host."
             exit 1
         fi
         
         # Get SMC information from config
         smc_node=$(jq -r '.[] | select(.type == "smc")' "$JSON_FILE")
         if [[ -z "$smc_node" ]]; then
-            echo "Error: No SMC node found in configuration."
+            print_error "No SMC node found in configuration."
             exit 1
         fi
         
         smc_user=$(echo "$smc_node" | jq -r '.user')
         smc_pass=$(echo "$smc_node" | jq -r '.pass')
         smc_ip=$(echo "$smc_node" | jq -r '.ip')
-        
-        if [[ "$SCP_MODE" == "true" ]]; then
-            do_scp "$smc_user" "$smc_pass" "$smc_ip" "$bmc_user" "$bmc_pass" "$bmc_ip"
-        else
-            do_ssh "$smc_user" "$smc_pass" "$smc_ip" "$bmc_user" "$bmc_pass" "$bmc_ip"
-        fi
+        validate_connection_fields "SMC" "$smc_user" "$smc_pass" "$smc_ip" || exit 1
+        run_selected_action "$smc_user" "$smc_pass" "$smc_ip" "$bmc_user" "$bmc_pass" "$bmc_ip"
     elif [[ "$target" =~ ^host([0-9]+)$ ]]; then
-        idx=$((${BASH_REMATCH[1]} - 1))
+        host_number=${BASH_REMATCH[1]}
+        if (( 10#$host_number < 1 )); then
+            print_error "Host number must be greater than 0."
+            exit 1
+        fi
+        idx=$((10#$host_number - 1))
         host_data=$(echo "$node" | jq ".hosts[$idx]")
-        [[ "$host_data" == "null" ]] && { echo "Error: $target not defined."; exit 1; }
+        [[ "$host_data" == "null" ]] && { print_error "$target not defined."; exit 1; }
         u=$(echo "$host_data" | jq -r '.user')
         p=$(echo "$host_data" | jq -r '.pass')
         i=$(echo "$host_data" | jq -r '.ip')
-        if [[ "$SCP_MODE" == "true" ]]; then
-            do_scp "$u" "$p" "$i"
-        else
-            do_ssh "$u" "$p" "$i"
-        fi
+        validate_connection_fields "$identifier $target" "$u" "$p" "$i" || exit 1
+        run_selected_action "$u" "$p" "$i"
     else
-        echo "Error: Unknown target '$target'."
+        print_error "Unknown target '$target'."
+        exit 1
     fi
     exit 0
 fi
+
+print_error "Too many arguments."
+print_usage
+exit 1
