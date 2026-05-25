@@ -256,7 +256,7 @@ echo -e "${BLUE}  SSH Manager (sshm) QA Test Suite${NC}"
 echo -e "${BLUE}======================================${NC}\n"
 
 echo -e "${BLUE}Checking dependencies...${NC}"
-for cmd in jq sshpass; do
+for cmd in jq ssh scp sshpass; do
     if command -v "$cmd" &> /dev/null; then
         echo -e "${GREEN}OK${NC} $cmd installed"
     else
@@ -279,6 +279,10 @@ run_test "List Extra Argument" error error timeout 5 env "SSHM_CONFIG=$CONFIG_FI
 run_test "Too Many Arguments" error error timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" 1 2 3
 run_test "Missing Command Argument" error error timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -c
 run_test "Missing SCP Destination Argument" error error timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s local-only
+run_test "Missing Port Argument" error_contains:"requires a port" error timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -P
+run_test "Invalid Port String" error_contains:"Invalid SSH port" error timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -P abc 1
+run_test "Invalid Port Zero" error_contains:"Invalid SSH port" error timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -P 0 1
+run_test "Invalid Port Range" error_contains:"Invalid SSH port" error timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" --port=65536 1
 
 if [[ -n "$SERVER_INDEX" ]]; then
     run_test "Invalid Host Target" error error timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" "$SERVER_INDEX" host99

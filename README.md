@@ -8,10 +8,10 @@ Install the required tools:
 
 ```bash
 sudo apt update
-sudo apt install jq sshpass fping -y
+sudo apt install jq openssh-client sshpass fping -y
 ```
 
-`fping` is optional. If it is unavailable, `sshm -p` falls back to `ping`.
+`fping` is optional. If it is unavailable, `sshm -p` falls back to `ping`. `sshpass` is only used for inventory entries that store `pass`.
 
 ## Configuration
 
@@ -45,12 +45,14 @@ The inventory supports these node types:
     "name": "server1",
     "bmc": {
       "ip": "x.x.x.x",
+      "port": 22,
       "user": "root",
       "pass": "password"
     },
     "hosts": [
       {
         "ip": "x.x.x.x",
+        "port": 22,
         "user": "root",
         "pass": "password"
       }
@@ -61,6 +63,7 @@ The inventory supports these node types:
     "type": "client",
     "name": "client1",
     "ip": "x.x.x.x",
+    "port": 2222,
     "user": "username",
     "pass": "password",
     "note": "Example client"
@@ -69,6 +72,7 @@ The inventory supports these node types:
     "type": "smc",
     "name": "smc",
     "ip": "x.x.x.x",
+    "port": 22,
     "user": "root",
     "pass": "password",
     "note": "SMC accessed through a server BMC"
@@ -86,16 +90,21 @@ Usage:
   sshm [-p] [-c "command"] <Name|Num>           : SSH to ServerBMC|Client
   sshm [-p] [-c "command"] <Name|Num> host<N>   : SSH to ServerHost (NIC)
   sshm [-p] [-c "command"] <Name|Num> smc       : SSH to SMC via BMC
+  sshm [-P <port>] <Name|Num>                   : SSH using a temporary port override
   sshm -s <source> <dest> <Name|Num>            : SCP file transfer
   sshm -s <source> <dest> <Name|Num> host<N>    : SCP to ServerHost
 
 Options:
   -p    Perform a ping check before connecting
+  -P    Override SSH port for the selected target
+  --port Override SSH port for the selected target
   -c    Execute a remote command instead of opening interactive shell
   -s    SCP file transfer mode (requires source and destination)
   -h    Print this help message
   -l    List all nodes
 ```
+
+`port` is optional and defaults to `22`. `pass` is optional; omit it to use SSH keys or the standard interactive password prompt.
 
 ## Examples
 
@@ -104,6 +113,8 @@ Interactive SSH:
 ```bash
 sshm -p 1 host1
 sshm server1 bmc
+sshm client1
+sshm -P 2222 client1
 ```
 
 Remote command execution:
@@ -112,6 +123,7 @@ Remote command execution:
 sshm -c "uptime" server1
 sshm -c "df -h" 1
 sshm -p -c "free -m" client1
+sshm -P 2222 -c "hostname" client1
 ```
 
 SMC access through a server BMC:
