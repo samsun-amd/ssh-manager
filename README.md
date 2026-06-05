@@ -8,10 +8,16 @@ Install the required tools:
 
 ```bash
 sudo apt update
-sudo apt install jq openssh-client sshpass fping -y
+sudo apt install jq openssh-client sshpass tar gzip fping pv -y
 ```
 
-`fping` is optional. If it is unavailable, `sshm -p` falls back to `ping`. `sshpass` is only used for inventory entries that store `pass`.
+Or run the bundled installer, which handles dependencies, installs the binary, and seeds a private inventory:
+
+```bash
+./install.sh
+```
+
+`fping` is optional. If it is unavailable, `sshm -p` falls back to `ping`. `sshpass` is only used for inventory entries that store `pass`. `tar`/`gzip` enable fast directory transfers. `pv` is optional and enables a progress bar for directory transfers.
 
 ## Configuration
 
@@ -150,6 +156,34 @@ sshm -s remote:/var/log/syslog ./logs/ server1 host1
 sshm -s local_file.txt remote:/tmp/ server1 smc
 ```
 
+### Fast directory transfers
+
+When the source of a `-s` transfer is a directory, `sshm` streams it with
+`tar | ssh tar -x` instead of `scp -r`. A single SSH connection carries the
+whole tree, which is dramatically faster than `scp -r` for directories with many
+small files over slow links (for example BMC/SMC). This works for both upload and
+download, and remains compatible with the `host<N>` and `smc` jump-host paths.
+
+Compression is decided automatically:
+
+- Small directories (below `SSHM_TAR_THRESHOLD`, default 10MB) are sent without
+  gzip — compression would cost CPU for little gain.
+- Large directories are gzip-compressed to save bandwidth, unless their contents
+  are already mostly compressed (e.g. `.gz`, `.zip`, `.jpg`, `.mp4`), in which
+  case gzip is skipped.
+
+A progress bar is shown when `pv` is installed. Relevant environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SSHM_PROGRESS` | `auto` | `auto` shows a `pv` progress bar when `pv` exists; `off` disables it |
+| `SSHM_TAR_THRESHOLD` | `10485760` | Directory size (bytes) at/above which gzip is considered |
+| `SSHM_FORCE_COMPRESS` | `0` | Set to `1` to always gzip the tar stream |
+| `SSHM_NO_COMPRESS` | `0` | Set to `1` to never gzip the tar stream |
+
+If the remote host does not have `tar`, `sshm` automatically falls back to
+`scp -r`.
+
 ## Error Handling
 
 `sshm` leaves SSH and SCP diagnostics visible and adds a concise summary for common transport failures.
@@ -164,6 +198,23 @@ Typical failures include:
 Remote command exit codes are preserved. For example, `sshm -c "exit 42" client1` exits with code `42`.
 
 ## Installation
+
+The recommended way is the bundled installer, which is idempotent and safe to
+re-run. It installs dependencies, copies the binary, and seeds a private
+inventory without overwriting an existing one:
+
+```bash
+./install.sh
+```
+
+The installer honors a couple of overrides:
+
+```bash
+PREFIX="$HOME/.local" ./install.sh          # install without sudo into a user prefix
+SSHM_CONFIG_DIR="$HOME/cfg" ./install.sh    # change where the private inventory is created
+```
+
+### Manual installation
 
 Install the script:
 

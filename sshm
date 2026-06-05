@@ -6,6 +6,19 @@ DEFAULT_PRIVATE_CONFIG="$HOME/note/ssh_remote.json"
 EXAMPLE_CONFIG="$SCRIPT_DIR/ssh_remote.json"
 DEFAULT_SSH_PORT=22
 
+# Directory transfer tuning (all overridable via environment).
+# Directories are streamed with `tar | ssh tar -x` instead of `scp -r`, which is
+# far faster for trees with many small files over slow links (e.g. BMC/SMC).
+SSHM_TAR_THRESHOLD="${SSHM_TAR_THRESHOLD:-10485760}"   # bytes; compress only when >= this size
+SSHM_COMPRESSED_RATIO="${SSHM_COMPRESSED_RATIO:-70}"   # percent; skip gzip if already-compressed bytes >= this
+SSHM_PROGRESS="${SSHM_PROGRESS:-auto}"                 # auto = use pv when available; off = no progress bar
+SSHM_FORCE_COMPRESS="${SSHM_FORCE_COMPRESS:-0}"        # 1 = always gzip the tar stream
+SSHM_NO_COMPRESS="${SSHM_NO_COMPRESS:-0}"              # 1 = never gzip the tar stream
+
+# File extensions whose contents are already compressed; re-compressing them
+# wastes CPU for negligible size gain, so the tar stream skips gzip for them.
+ALREADY_COMPRESSED_EXT="gz tgz bz2 tbz2 xz txz zst zip 7z rar lz4 jpg jpeg png gif webp heic mp4 mkv mov avi webm mp3 flac ogg opus aac pdf apk deb rpm jar"
+
 if [[ -n "${SSHM_CONFIG:-}" ]]; then
     JSON_FILE="$SSHM_CONFIG"
 elif [[ -r "$DEFAULT_PRIVATE_CONFIG" ]]; then
@@ -85,6 +98,92 @@ scp_with_optional_password() {
         scp "$@"
     fi
 }
+
+# Shared sh snippet: given a directory path in $1, set shell vars `t` (total
+# bytes) and `c` (bytes belonging to already-compressed file types). Used both
+# locally (upload) and over ssh (download) so the sizing logic stays identical.
+# Best-effort: where `find -printf` is unavailable, `c` is 0, which simply means
+# "compress large dirs" (the safe default).
+_dir_size_snippet() {
+    cat <<EOF
+t=\$(du -sk "\$1" 2>/dev/null | awk '{print \$1*1024; exit}')
+c=\$(find "\$1" -type f -printf '%s %f\n' 2>/dev/null | awk -v env_exts="$ALREADY_COMPRESSED_EXT" '
+  BEGIN { n=split(env_exts, E, " "); for (k=1;k<=n;k++) M[E[k]]=1 }
+  { sz=\$1; name=\$2; q=split(name, A, "."); ext=(q>1)?tolower(A[q]):""; if (ext in M) acc+=sz }
+  END { print acc+0 }')
+EOF
+}
+
+# Program (for local use) that prints "<total_bytes> <compressed_bytes>" for the
+# directory passed as $1.
+local_dir_stat_program() {
+    _dir_size_snippet
+    printf 'echo "${t:-0} ${c:-0}"\n'
+}
+
+# Program (for remote use over ssh) that prints
+# "<has_tar> <is_dir> <total_bytes> <compressed_bytes>" for the path in $1.
+# A single round trip answers every download decision.
+remote_dir_probe_program() {
+    cat <<'EOF'
+if command -v tar >/dev/null 2>&1; then ht=1; else ht=0; fi
+if [ -d "$1" ]; then isdir=1; else isdir=0; fi
+EOF
+    printf 'if [ "$isdir" = 1 ]; then\n'
+    _dir_size_snippet
+    printf 'else t=0; c=0; fi\n'
+    printf 'echo "$ht $isdir ${t:-0} ${c:-0}"\n'
+}
+
+# Program (for remote use over ssh) that prints "1" if tar is on PATH, else "0".
+remote_has_tar_program() {
+    printf 'if command -v tar >/dev/null 2>&1; then echo 1; else echo 0; fi\n'
+}
+
+# Decide whether to gzip the tar stream given measured directory stats.
+# Echoes "z" to enable gzip, or "" to use a plain tar.
+decide_compression() {
+    local total=${1:-0} compressed=${2:-0}
+
+    [[ "$SSHM_NO_COMPRESS" == "1" ]] && { printf ""; return; }
+    [[ "$SSHM_FORCE_COMPRESS" == "1" ]] && { printf "z"; return; }
+
+    # Too small to be worth the CPU.
+    if [[ ! "$total" =~ ^[0-9]+$ ]] || (( total < SSHM_TAR_THRESHOLD )); then
+        printf ""
+        return
+    fi
+
+    # Already mostly compressed content: re-compressing is wasted CPU.
+    if [[ "$compressed" =~ ^[0-9]+$ ]] && (( total > 0 && compressed * 100 / total >= SSHM_COMPRESSED_RATIO )); then
+        printf ""
+        return
+    fi
+
+    printf "z"
+}
+
+# Whether to show a pv progress bar for stream transfers.
+progress_enabled() {
+    [[ "$SSHM_PROGRESS" != "off" ]] && command -v pv &> /dev/null
+}
+
+# Pass-through pipe stage that shows a progress bar when pv is available.
+# With a known size ($1) it shows percent/ETA; with an empty size it shows
+# throughput only. Falls back to `cat` so the pipeline shape stays constant.
+maybe_pv() {
+    local size=$1
+    if progress_enabled; then
+        if [[ -n "$size" && "$size" != "0" ]]; then
+            pv -s "$size"
+        else
+            pv
+        fi
+    else
+        cat
+    fi
+}
+
 
 validate_port() {
     local label=$1 port=$2
@@ -231,7 +330,19 @@ print_usage() {
     echo "  -l    List all nodes"
     echo ""
     echo "Environment:"
-    echo "  SSHM_CONFIG    Override the JSON inventory path"
+    echo "  SSHM_CONFIG          Override the JSON inventory path"
+    echo "  SSHM_PROGRESS        auto (default) shows a pv progress bar for directory"
+    echo "                       transfers when pv is installed; set to 'off' to disable"
+    echo "  SSHM_TAR_THRESHOLD   Directory size in bytes at/above which the tar stream is"
+    echo "                       gzip-compressed (default 10485760 = 10MB)"
+    echo "  SSHM_FORCE_COMPRESS  Set to 1 to always gzip the directory tar stream"
+    echo "  SSHM_NO_COMPRESS     Set to 1 to never gzip the directory tar stream"
+    echo ""
+    echo "Directory transfers:"
+    echo "  When the source is a directory, sshm streams it with 'tar | ssh tar -x'"
+    echo "  instead of 'scp -r', which is far faster for many small files. gzip is"
+    echo "  applied automatically for large, non-precompressed trees. If the remote"
+    echo "  lacks tar, sshm falls back to scp -r automatically."
     echo ""
     echo "SCP Examples:"
     echo "  # Upload file to remote"
@@ -326,6 +437,84 @@ do_ssh() {
     fi
 }
 
+# Stream a local directory to the remote with `tar | ssh tar -x`.
+# Globals expected: u p i port ju jp ji jport (connection), local_path,
+# remote_dest (target parent directory on the remote). Returns the transfer
+# exit code; 0 on success.
+stream_upload_dir() {
+    local total compressed zflag stat_out
+    stat_out=$(bash -c "$(local_dir_stat_program)" _ "$local_path" 2>/dev/null)
+    total=${stat_out%% *}
+    compressed=${stat_out##* }
+    zflag=$(decide_compression "$total" "$compressed")
+
+    local parent base q_dest
+    parent=$(dirname "$local_path")
+    base=$(basename "$local_path")
+    q_dest=$(shell_quote "$remote_dest")
+
+    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port")
+    [[ -n "$ji" ]] && ssh_opts+=(-o "ProxyCommand=$(build_proxy_command "$ju" "$jp" "$ji" "$jport")")
+
+    # Ensure the destination directory exists on the remote.
+    ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i" "mkdir -p $q_dest" || return $?
+
+    local tar_create="-c" tar_extract="-x"
+    if [[ "$zflag" == "z" ]]; then
+        tar_create="-cz"
+        tar_extract="-xz"
+        echo -e "${GREEN}Streaming directory (tar + gzip)...${NC}"
+    else
+        echo -e "${GREEN}Streaming directory (tar)...${NC}"
+    fi
+    # pv shows percent against uncompressed size when not gzipping; throughput otherwise.
+    local pv_size="$total"
+    [[ "$zflag" == "z" ]] && pv_size=""
+
+    tar -C "$parent" $tar_create -f - "$base" \
+        | maybe_pv "$pv_size" \
+        | ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i" "tar $tar_extract -f - -C $q_dest"
+    local codes=("${PIPESTATUS[@]}")
+    # Fail if tar (first) or ssh/remote-tar (last) failed; pv exit is ignored.
+    [[ "${codes[0]}" -ne 0 ]] && return "${codes[0]}"
+    return "${codes[${#codes[@]}-1]}"
+}
+
+# Stream a remote directory to a local path with `ssh tar -c | tar -x`.
+# Globals expected: connection vars, remote_path (remote dir), local_path
+# (local parent dir), plus precomputed remote_total / remote_compressed.
+stream_download_dir() {
+    local zflag
+    zflag=$(decide_compression "$remote_total" "$remote_compressed")
+
+    local q_remote_parent q_remote_base
+    q_remote_parent=$(shell_quote "$(dirname "$remote_path")")
+    q_remote_base=$(shell_quote "$(basename "$remote_path")")
+
+    mkdir -p "$local_path" || return $?
+
+    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port")
+    [[ -n "$ji" ]] && ssh_opts+=(-o "ProxyCommand=$(build_proxy_command "$ju" "$jp" "$ji" "$jport")")
+
+    local tar_create="-c" tar_extract="-x"
+    if [[ "$zflag" == "z" ]]; then
+        tar_create="-cz"
+        tar_extract="-xz"
+        echo -e "${GREEN}Streaming directory (tar + gzip)...${NC}"
+    else
+        echo -e "${GREEN}Streaming directory (tar)...${NC}"
+    fi
+    local pv_size="$remote_total"
+    [[ "$zflag" == "z" ]] && pv_size=""
+
+    ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i" "tar -C $q_remote_parent $tar_create -f - $q_remote_base" \
+        | maybe_pv "$pv_size" \
+        | tar $tar_extract -f - -C "$local_path"
+    local codes=("${PIPESTATUS[@]}")
+    [[ "${codes[0]}" -ne 0 ]] && return "${codes[0]}"
+    return "${codes[${#codes[@]}-1]}"
+}
+
 # Function to perform SCP transfer
 do_scp() {
     local u=$1 p=$2 i=$3 port=${4:-$DEFAULT_SSH_PORT} ju=${5:-} jp=${6:-} ji=${7:-} jport=${8:-$DEFAULT_SSH_PORT}
@@ -386,11 +575,34 @@ do_scp() {
         else
              echo -e "${GREEN}Uploading $local_path -> $u@$target_endpoint:$remote_path${NC}"
         fi
-        
+
+        # Fast path: stream directories with tar instead of scp -r, when the
+        # remote has tar available. Falls back to scp -r otherwise.
+        if [[ -d "$local_path" ]]; then
+            local remote_has_tar
+            local probe_ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port")
+            [[ -n "$ji" ]] && probe_ssh_opts+=(-o "ProxyCommand=$(build_proxy_command "$ju" "$jp" "$ji" "$jport")")
+            remote_has_tar=$(ssh_with_optional_password "$p" "${probe_ssh_opts[@]}" "$u@$i" "$(remote_has_tar_program)" 2>/dev/null)
+
+            if [[ "$remote_has_tar" == "1" ]]; then
+                local remote_dest="$remote_path"
+                stream_upload_dir
+                exit_code=$?
+                if [[ $exit_code -eq 0 ]]; then
+                    echo -e "${GREEN}Transfer completed successfully${NC}"
+                else
+                    print_error "Directory stream transfer failed with exit code $exit_code."
+                fi
+                cleanup_error_file "$err_file"
+                return $exit_code
+            fi
+            echo -e "${YELLOW}Remote 'tar' not available; falling back to scp -r.${NC}" >&2
+        fi
+
         # Construct final command
         local cmd_flags=("${scp_opts[@]}")
         [[ -n "$recursive_flag" ]] && cmd_flags+=("$recursive_flag")
-        
+
         if [[ -n "$err_file" ]]; then
             scp_with_optional_password "$p" "${cmd_flags[@]}" "$local_path" "$u@$i:$remote_path" 2> >(tee "$err_file" >&2)
         else
@@ -404,24 +616,26 @@ do_scp() {
              echo -e "${GREEN}Downloading $u@$target_endpoint:$remote_path -> $local_path${NC}"
         fi
 
-        # Check if remote is directory for recursive download
+        # One round trip answers: does the remote have tar, is the path a
+        # directory, and (if so) its total/compressed byte counts.
         local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port")
         if [[ -n "$ji" ]]; then
              ssh_opts+=(-o "ProxyCommand=$(build_proxy_command "$ju" "$jp" "$ji" "$jport")")
         fi
 
-        local probe_err_file probe_exit quoted_remote_path
+        local probe_err_file probe_exit quoted_remote_path probe_out probe_cmd
         probe_err_file=$(make_error_file) || probe_err_file=""
         quoted_remote_path=$(shell_quote "$remote_path")
+        # set -- puts the path safely in $1 regardless of spaces; ssh joins args
+        # with spaces, so the path must be embedded in the command string here.
+        probe_cmd="set -- $quoted_remote_path; $(remote_dir_probe_program)"
         if [[ -n "$probe_err_file" ]]; then
-            ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i" "test -d $quoted_remote_path" 2> >(tee "$probe_err_file" >&2)
+            probe_out=$(ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i" "$probe_cmd" 2> >(tee "$probe_err_file" >&2))
         else
-            ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i" "test -d $quoted_remote_path"
+            probe_out=$(ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i" "$probe_cmd")
         fi
         probe_exit=$?
-        if [[ $probe_exit -eq 0 ]]; then
-            recursive_flag="-r"
-        elif [[ $probe_exit -ne 1 ]]; then
+        if [[ $probe_exit -ne 0 ]]; then
             report_ssh_failure "$probe_exit" "$u" "$i" "$port" "$probe_err_file" "remote path probe" || \
                 print_error "Unable to probe remote path '$remote_path' for $u@$target_endpoint. Exit code: $probe_exit."
             cleanup_error_file "$probe_err_file"
@@ -429,6 +643,26 @@ do_scp() {
             return "$probe_exit"
         fi
         cleanup_error_file "$probe_err_file"
+
+        local remote_has_tar remote_is_dir remote_total remote_compressed
+        read -r remote_has_tar remote_is_dir remote_total remote_compressed <<< "$probe_out"
+
+        # Fast path: stream a remote directory with tar when both ends have it.
+        if [[ "$remote_is_dir" == "1" ]]; then
+            if [[ "$remote_has_tar" == "1" ]] && command -v tar &> /dev/null; then
+                stream_download_dir
+                exit_code=$?
+                if [[ $exit_code -eq 0 ]]; then
+                    echo -e "${GREEN}Transfer completed successfully${NC}"
+                else
+                    print_error "Directory stream transfer failed with exit code $exit_code."
+                fi
+                cleanup_error_file "$err_file"
+                return $exit_code
+            fi
+            echo -e "${YELLOW}tar not available on both ends; falling back to scp -r.${NC}" >&2
+            recursive_flag="-r"
+        fi
 
         local cmd_flags=("${scp_opts[@]}")
         [[ -n "$recursive_flag" ]] && cmd_flags+=("$recursive_flag")

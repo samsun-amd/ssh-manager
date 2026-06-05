@@ -317,12 +317,27 @@ if [[ "${RUN_SSHM_LIVE_TESTS:-0}" == "1" ]]; then
         run_test "SCP Upload Single File" success scp timeout 20 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "$TEST_FILE" remote:/tmp/ "$CLIENT_NAME"
         run_test "SCP Download Single File" success scp timeout 20 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "remote:/tmp/$(basename "$TEST_FILE")" "$DOWNLOAD_FILE" "$CLIENT_NAME"
         rm -f "$TEST_FILE" "$DOWNLOAD_FILE"
+
+        # Directory transfers use the tar-stream fast path.
+        UPLOAD_DIR="/tmp/sshm_dir_up_$(date +%s)"
+        REMOTE_DIR_BASE="/tmp/sshm_dir_remote_$(date +%s)"
+        DOWNLOAD_DIR="/tmp/sshm_dir_down_$(date +%s)"
+        mkdir -p "$UPLOAD_DIR"
+        for n in 1 2 3 4 5; do printf "small file %s\n" "$n" > "$UPLOAD_DIR/f_$n.txt"; done
+        run_test "SCP Upload Directory (tar stream)" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "$UPLOAD_DIR/" "remote:$REMOTE_DIR_BASE/" "$CLIENT_NAME"
+        mkdir -p "$DOWNLOAD_DIR"
+        run_test "SCP Download Directory (tar stream)" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "remote:$REMOTE_DIR_BASE/$(basename "$UPLOAD_DIR")" "$DOWNLOAD_DIR/" "$CLIENT_NAME"
+        run_test "SCP Directory Progress Off" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" SSHM_PROGRESS=off "$SSHM" -s "$UPLOAD_DIR/" "remote:$REMOTE_DIR_BASE/" "$CLIENT_NAME"
+        rm -rf "$UPLOAD_DIR" "$DOWNLOAD_DIR"
     else
         skip_test "Remote Command on Client Name" "No client node in config" command
         skip_test "Exit Code Propagation" "No client node in config" edge
         skip_test "Ping Check with Command" "No client node in config" network
         skip_test "SCP Upload Single File" "No client node in config" scp
         skip_test "SCP Download Single File" "No client node in config" scp
+        skip_test "SCP Upload Directory (tar stream)" "No client node in config" scp
+        skip_test "SCP Download Directory (tar stream)" "No client node in config" scp
+        skip_test "SCP Directory Progress Off" "No client node in config" scp
     fi
 
     if [[ -n "$CLIENT_INDEX" ]]; then
@@ -357,6 +372,9 @@ else
     skip_test "Ping Check with Command" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" network
     skip_test "SCP Upload Single File" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" scp
     skip_test "SCP Download Single File" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" scp
+    skip_test "SCP Upload Directory (tar stream)" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" scp
+    skip_test "SCP Download Directory (tar stream)" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" scp
+    skip_test "SCP Directory Progress Off" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" scp
     skip_test "Exit Code Propagation" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" edge
 fi
 
