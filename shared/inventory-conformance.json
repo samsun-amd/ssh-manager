@@ -1,0 +1,92 @@
+{
+  "_comment": "Selector->Endpoint expectations shared by sshm (bash) and @ssh-manager/core. Uses the committed example ssh_remote.json shape with placeholder IPs. Keeps both implementations aligned without sharing code.",
+  "inventory": [
+    {
+      "type": "server",
+      "name": "server1",
+      "bmc": { "ip": "10.0.0.1", "user": "root", "pass": "0penBmc" },
+      "hosts": [{ "ip": "10.0.0.11", "user": "u1", "pass": "p1" }]
+    },
+    {
+      "type": "server",
+      "name": "server2",
+      "bmc": { "ip": "10.0.0.2", "user": "root", "pass": "0penBmc", "port": 2222 },
+      "hosts": [
+        { "ip": "10.0.0.21", "user": "u2", "pass": "p2" },
+        { "ip": "10.0.0.22", "user": "u3", "pass": "p3", "port": 2200 }
+      ]
+    },
+    {
+      "type": "client",
+      "name": "client",
+      "ip": "10.0.0.50",
+      "user": "alice",
+      "pass": "secret"
+    },
+    {
+      "type": "smc",
+      "name": "smc",
+      "ip": "10.0.0.60",
+      "user": "root",
+      "pass": "0penBmc"
+    }
+  ],
+  "cases": [
+    {
+      "selector": "client",
+      "expect": { "id": "client", "conn": { "host": "10.0.0.50", "port": 22, "user": "alice" }, "jump": null }
+    },
+    {
+      "selector": "3",
+      "expect": { "id": "client", "conn": { "host": "10.0.0.50", "port": 22, "user": "alice" }, "jump": null }
+    },
+    {
+      "selector": "10.0.0.50",
+      "expect": { "id": "client", "conn": { "host": "10.0.0.50", "port": 22, "user": "alice" }, "jump": null }
+    },
+    {
+      "selector": "server1",
+      "expect": { "id": "server1/bmc", "conn": { "host": "10.0.0.1", "port": 22, "user": "root" }, "jump": null }
+    },
+    {
+      "selector": "server1",
+      "sub": "bmc",
+      "expect": { "id": "server1/bmc", "conn": { "host": "10.0.0.1", "port": 22, "user": "root" }, "jump": null }
+    },
+    {
+      "selector": "server1",
+      "sub": "host1",
+      "expect": {
+        "id": "server1/host1",
+        "conn": { "host": "10.0.0.11", "port": 22, "user": "u1" },
+        "jump": { "host": "10.0.0.1", "port": 22, "user": "root" }
+      }
+    },
+    {
+      "selector": "server2",
+      "sub": "host2",
+      "expect": {
+        "id": "server2/host2",
+        "conn": { "host": "10.0.0.22", "port": 2200, "user": "u3" },
+        "jump": { "host": "10.0.0.2", "port": 2222, "user": "root" }
+      }
+    },
+    {
+      "selector": "server1",
+      "sub": "smc",
+      "expect": {
+        "id": "server1/smc",
+        "conn": { "host": "10.0.0.60", "port": 22, "user": "root" },
+        "jump": { "host": "10.0.0.1", "port": 22, "user": "root" }
+      }
+    },
+    {
+      "selector": "10.0.0.22",
+      "expect": {
+        "id": "server2/host2",
+        "conn": { "host": "10.0.0.22", "port": 2200, "user": "u3" },
+        "jump": { "host": "10.0.0.2", "port": 2222, "user": "root" }
+      }
+    }
+  ]
+}

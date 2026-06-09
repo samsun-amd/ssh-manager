@@ -1,0 +1,12 @@
+{
+  "_comment": "De-hardcoded transfer tuning shared by sshm and @ssh-manager/core. sshm can read these with jq; core imports them. Mirrors the env-overridable knobs originally hardcoded in sshm.",
+  "tarThresholdBytes": 10485760,
+  "compressedRatioPercent": 70,
+  "alreadyCompressedExt": [
+    "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst", "zip", "7z", "rar", "lz4",
+    "jpg", "jpeg", "png", "gif", "webp", "heic",
+    "mp4", "mkv", "mov", "avi", "webm",
+    "mp3", "flac", "ogg", "opus", "aac",
+    "pdf", "apk", "deb", "rpm", "jar"
+  ]
+}
