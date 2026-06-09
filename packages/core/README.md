@@ -24,10 +24,10 @@ layers compose top-to-bottom; each one only depends on the layers above it.
 ```
 inventory  ssh_remote.json  ->  Endpoint        (pure data, no network)
    |
-connection Endpoint         ->  SshSession      (ssh2 Client, optional 1 jump hop, OS probe)
+connection Endpoint         ->  SshSession      (ssh2 Client, optional 1 jump hop, OS + SFTP probe)
    |        SshPool          ->  pooled, health-checked, idle-evicted sessions
    |
-fs         SshSession        ->  RemoteFs        (SFTP ops + RemotePath + remote ~ expand)
+fs         SshSession        ->  RemoteFs        (SFTP ops — or exec fallback — + RemotePath + remote ~ expand)
    |
 transfer   SshSession(s)     ->  TransferEngine  (hub<->remote + remote<->remote relay, byte progress, abort)
 ```
@@ -45,15 +45,32 @@ and `adhocEndpoint()` for targets not in the inventory.
   (single hop only). On first use it probes the remote OS via `uname -s`
   (failure/Windows -> `'windows'`). Exposes `sftp()`, `exec()`, `detectOs()`,
   `isAlive()`, `end()`.
+- **SFTP capability probe.** Some embedded sshds (e.g. a BusyBox SMC) ship no
+  SFTP subsystem, so `sftp()` would fail there. `checkSftp()` probes once
+  (racing an `sftp()` open against a short timeout) and caches the result in the
+  `sftpAvailable` getter (`true` / `false` / `null` before probed). `SshPool`
+  runs it right after the OS probe, so by the time a session is handed out its
+  capability is known. `execChannel(command)` returns the **raw, unbuffered**
+  ssh2 duplex stream (unlike `exec()`, which buffers stdout) — used by the fs and
+  transfer layers for binary-safe `cat` streaming on no-SFTP endpoints.
 - `SshPool` keeps sessions keyed by `user@host:port` (jump prefixed). Features:
   handshake `readyTimeout`, idle eviction, liveness check on reuse, a
   `maxPerKey` cap, auto-eviction when the transport dies, and `withSession()`
   (acquire / run / always release).
 
-### `fs/` — SFTP + OS-aware paths
+### `fs/` — SFTP + OS-aware paths (with exec fallback)
 - `RemoteFs` promisifies SFTP: `list`, `readFile`, `writeFile`, `mkdirp`,
   `rename`, `remove`, `stat`. Resolves remote `~` via SFTP `realpath('.')` (works
   on both POSIX and Windows OpenSSH; no shell needed) and caches it.
+- **Exec fallback (no SFTP).** When `session.sftpAvailable === false`, every
+  method transparently switches to POSIX/BusyBox shell commands over `exec` /
+  `execChannel` instead of SFTP — same public signatures, so callers don't care:
+  `home()` via `printf %s "$HOME"`, `stat`/`list` via `stat -c '%F|%s|%Y|%n'`
+  (with `find -maxdepth 1` for listing), `mkdirp` via `mkdir -p`, `remove` via
+  `rm -rf`, and `readFile`/`writeFile` via binary-safe `cat` / `cat > file`
+  (no `base64`, no truncation). SFTP endpoints are byte-for-byte unchanged.
+  Limitation: the line-parsed `list` does not support filenames containing a
+  literal newline (fine for the embedded targets this serves).
 - `RemotePath` is an OS-aware path helper (posix vs windows). It always sends
   forward slashes over the wire but understands Windows drive letters / UNC for
   display. `normalize()` collapses `.`/`..` and `isUnder(parent, child)` is the
@@ -61,15 +78,23 @@ and `adhocEndpoint()` for targets not in the inventory.
   it normalizes traversal before a prefix comparison so `..` cannot escape.
 
 ### `transfer/` — streaming transfers
-`TransferEngine` streams over SFTP with byte progress and `AbortSignal` support:
+`TransferEngine` streams with byte progress and `AbortSignal` support:
 - `hubToRemote` / `remoteToHub` — upload / download (files or, with
   `recursive`, trees).
-- `remoteToRemote` — relays A -> B **through the hub** over SFTP without
-  spilling to disk (the hub is the only machine guaranteed to reach both ends).
+- `remoteToRemote` — relays A -> B **through the hub** without spilling to disk
+  (the hub is the only machine guaranteed to reach both ends).
 
 Every transfer pipes through a single helper that, on an error from **either**
 side or on abort, destroys both streams and removes the abort listener exactly
-once — so a failed transfer never leaks an SFTP channel.
+once — so a failed transfer never leaks a channel.
+
+**Per-side stream selection.** Each end of a transfer independently uses SFTP or
+the exec fallback based on its `sftpAvailable`, via `openRead` / `openWrite`. So
+a relay works for **any** mix — SFTP↔SFTP, SFTP↔exec, exec↔exec — letting an
+SFTP host copy to/from a no-SFTP SMC through the hub. `execstream.ts` provides
+`execReadStream` (`cat`) and `execWriteStream` (`cat > file`); the writer signals
+completion only after the remote process **exits 0**, never on stdin flush alone,
+so an upload can't be silently truncated.
 
 ### `types.ts`
 Shared types plus `SshConnectionError` (carries `endpointId` + `cause`, so a web
@@ -173,7 +198,9 @@ const ad  = adhocEndpoint({ host, port, user, password });
 // 2. connection: pooled ssh2 sessions w/ readyTimeout + idle evict + health check
 const pool = new SshPool({ readyTimeoutMs: 15000, idleTimeoutMs: 60000, maxPerKey: 4 });
 await pool.withSession(ep, async (session) => {
-  // 3. fs: SFTP operations, OS-aware paths, remote ~ expansion
+  // session.sftpAvailable is already probed; RemoteFs picks SFTP or the exec
+  // fallback automatically — same calls either way.
+  // 3. fs: SFTP (or exec) operations, OS-aware paths, remote ~ expansion
   const rfs = new RemoteFs(session);
   const home = await rfs.expandHome('~');
   const entries = await rfs.list(home);

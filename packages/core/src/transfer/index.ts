@@ -3,6 +3,7 @@ import * as path from 'path';
 import { SshSession } from '../connection';
 import { RemoteFs } from '../fs';
 import { TransferOptions, TransferProgress } from '../types';
+import { execReadStream, execWriteStream } from './execstream';
 
 function reportFactory(opts: TransferOptions, total: number | null) {
   let bytes = 0;
@@ -132,19 +133,40 @@ export class TransferEngine {
     await walk(localDir, remoteDir);
   }
 
-  private streamLocalToRemote(
+  /**
+   * Open a write stream to a remote path, choosing SFTP or exec (`cat > file`)
+   * based on whether the session's sshd offers an SFTP subsystem.
+   */
+  private async openWrite(rfs: RemoteFs, remotePath: string): Promise<DestroyableWritable> {
+    const session = rfs['session'] as SshSession;
+    if (session.sftpAvailable === false) {
+      return (await execWriteStream(session, remotePath)) as unknown as DestroyableWritable;
+    }
+    const sftp = await session.sftp();
+    return sftp.createWriteStream(remotePath) as unknown as DestroyableWritable;
+  }
+
+  /** Open a read stream from a remote path, choosing SFTP or exec (`cat`). */
+  private async openRead(rfs: RemoteFs, remotePath: string): Promise<DestroyableReadable> {
+    const session = rfs['session'] as SshSession;
+    if (session.sftpAvailable === false) {
+      return (await execReadStream(session, remotePath)) as unknown as DestroyableReadable;
+    }
+    const sftp = await session.sftp();
+    return sftp.createReadStream(remotePath) as unknown as DestroyableReadable;
+  }
+
+  private async streamLocalToRemote(
     localPath: string,
     rfs: RemoteFs,
     remotePath: string,
     report: (delta: number, file: string) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    return rfs['session'].sftp().then((sftp) => {
-      const name = path.basename(localPath);
-      const rs = fs.createReadStream(localPath);
-      const ws = sftp.createWriteStream(remotePath);
-      return pipeStreams(rs as unknown as DestroyableReadable, ws as unknown as DestroyableWritable, report, name, signal);
-    });
+    const name = path.basename(localPath);
+    const rs = fs.createReadStream(localPath);
+    const ws = await this.openWrite(rfs, remotePath);
+    return pipeStreams(rs as unknown as DestroyableReadable, ws, report, name, signal);
   }
 
   /** Download a remote file/dir to the hub. */
@@ -187,19 +209,17 @@ export class TransferEngine {
     }
   }
 
-  private streamRemoteToLocal(
+  private async streamRemoteToLocal(
     rfs: RemoteFs,
     remotePath: string,
     localPath: string,
     report: (delta: number, file: string) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    return rfs['session'].sftp().then((sftp) => {
-      const name = path.basename(remotePath);
-      const rs = sftp.createReadStream(remotePath);
-      const ws = fs.createWriteStream(localPath);
-      return pipeStreams(rs as unknown as DestroyableReadable, ws as unknown as DestroyableWritable, report, name, signal);
-    });
+    const name = path.basename(remotePath);
+    const rs = await this.openRead(rfs, remotePath);
+    const ws = fs.createWriteStream(localPath);
+    return pipeStreams(rs, ws as unknown as DestroyableWritable, report, name, signal);
   }
 
   /**
@@ -256,12 +276,12 @@ export class TransferEngine {
     report: (delta: number, file: string) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    const srcSftp = await srcFs['session'].sftp();
-    const dstSftp = await dstFs['session'].sftp();
+    // Each side picks SFTP or exec independently, so any mix relays correctly
+    // through the hub (e.g. an SFTP host -> a no-SFTP SMC).
     const name = srcFs.path.basename(srcPath);
-    const rs = srcSftp.createReadStream(srcPath);
-    const ws = dstSftp.createWriteStream(dstPath);
-    await pipeStreams(rs as unknown as DestroyableReadable, ws as unknown as DestroyableWritable, report, name, signal);
+    const rs = await this.openRead(srcFs, srcPath);
+    const ws = await this.openWrite(dstFs, dstPath);
+    await pipeStreams(rs, ws, report, name, signal);
   }
 }
 

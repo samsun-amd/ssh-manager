@@ -1,6 +1,6 @@
 import { Stats, SFTPWrapper } from 'ssh2';
 import { SshSession } from '../connection';
-import { DirEntry, ListOptions, RemoteOs } from '../types';
+import { DirEntry, ListOptions, RemoteOs, SshConnectionError } from '../types';
 import { RemotePath } from './pathutil';
 
 export { RemotePath } from './pathutil';
@@ -16,6 +16,20 @@ function entryType(mode: number): DirEntry['type'] {
   if (t === S_IFLNK) return 'symlink';
   if (t === S_IFREG) return 'file';
   return 'other';
+}
+
+/** Map BusyBox/coreutils `stat -c %F` text to a DirEntry type. */
+function fileTypeFromStat(desc: string): DirEntry['type'] {
+  const d = desc.trim().toLowerCase();
+  if (d === 'directory') return 'dir';
+  if (d === 'symbolic link') return 'symlink';
+  if (d === 'regular file' || d === 'regular empty file') return 'file';
+  return 'other';
+}
+
+/** Single-quote a path for POSIX sh, escaping embedded single quotes. */
+function shQuote(p: string): string {
+  return `'${p.replace(/'/g, `'\\''`)}'`;
 }
 
 /** Promisified, OS-aware SFTP file operations over a live session. */
@@ -34,9 +48,29 @@ export class RemoteFs {
     return this.session.sftp();
   }
 
+  /** True when this session has no SFTP subsystem and must use exec fallback. */
+  private get execOnly(): boolean {
+    return this.session.sftpAvailable === false;
+  }
+
+  /** Run an exec command, throwing a structured error on nonzero exit. */
+  private async run(command: string): Promise<string> {
+    const res = await this.session.exec(command);
+    if (res.code !== 0) {
+      const detail = res.stderr.trim() || `exit ${res.code}`;
+      throw new SshConnectionError(this.session.endpoint.id, detail);
+    }
+    return res.stdout;
+  }
+
   /** Resolve the remote home directory (for `~` expansion). Cached. */
   async home(): Promise<string> {
     if (this.homeCache) return this.homeCache;
+    if (this.execOnly) {
+      const out = await this.run('printf %s "${HOME:-$(pwd)}"');
+      this.homeCache = out.trim().replace(/\\/g, '/') || '/';
+      return this.homeCache;
+    }
     // SFTP realpath('.') resolves to the login directory on both POSIX and
     // Windows OpenSSH — no shell needed, so it works for Windows too.
     const sftp = await this.sftp();
@@ -61,6 +95,18 @@ export class RemoteFs {
 
   async stat(p: string): Promise<DirEntry> {
     const target = await this.expandHome(p);
+    if (this.execOnly) {
+      const out = await this.run(`stat -c '%F|%s|%Y' -- ${shQuote(target)}`);
+      const [desc, size, mtime] = out.trim().split('|');
+      return {
+        name: this.path.basename(target),
+        path: target,
+        type: fileTypeFromStat(desc || ''),
+        size: Number(size) || 0,
+        mtime: mtime ? Number(mtime) * 1000 : null,
+        mode: 0,
+      };
+    }
     const sftp = await this.sftp();
     const st = await new Promise<Stats>((resolve, reject) => {
       sftp.stat(target, (err, s) => (err ? reject(err) : resolve(s)));
@@ -81,34 +127,22 @@ export class RemoteFs {
   }
 
   private async listResolved(dir: string, opts: ListOptions): Promise<DirEntry[]> {
-    const sftp = await this.sftp();
-    const raw = await new Promise<Array<{ filename: string; attrs: Stats }>>((resolve, reject) => {
-      sftp.readdir(dir, (err, list) => (err ? reject(err) : resolve(list as never)));
-    });
+    const raw = this.execOnly ? await this.readdirExec(dir) : await this.readdirSftp(dir);
 
     const exts = opts.extensions?.map((e) => e.toLowerCase().replace(/^\./, ''));
     const out: DirEntry[] = [];
     for (const item of raw) {
-      const name = item.filename;
+      const name = item.name;
       if (!opts.includeHidden && name.startsWith('.')) continue;
-      const full = this.path.join(dir, name);
-      const type = entryType(item.attrs.mode);
+      const type = item.type;
       if (type === 'file' && exts && exts.length) {
         const dot = name.lastIndexOf('.');
         const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
         if (!exts.includes(ext)) continue;
       }
-      const entry: DirEntry = {
-        name,
-        path: full,
-        type,
-        size: item.attrs.size ?? 0,
-        mtime: item.attrs.mtime ? item.attrs.mtime * 1000 : null,
-        mode: item.attrs.mode,
-      };
-      out.push(entry);
+      out.push({ name, path: item.path, type, size: item.size, mtime: item.mtime, mode: item.mode });
       if (opts.recursive && type === 'dir') {
-        const children = await this.listResolved(full, opts);
+        const children = await this.listResolved(item.path, opts);
         out.push(...children);
       }
     }
@@ -119,8 +153,76 @@ export class RemoteFs {
     return out;
   }
 
+  /** Raw one-level read over SFTP. */
+  private async readdirSftp(dir: string): Promise<DirEntry[]> {
+    const sftp = await this.sftp();
+    const raw = await new Promise<Array<{ filename: string; attrs: Stats }>>((resolve, reject) => {
+      sftp.readdir(dir, (err, list) => (err ? reject(err) : resolve(list as never)));
+    });
+    return raw.map((item) => ({
+      name: item.filename,
+      path: this.path.join(dir, item.filename),
+      type: entryType(item.attrs.mode),
+      size: item.attrs.size ?? 0,
+      mtime: item.attrs.mtime ? item.attrs.mtime * 1000 : null,
+      mode: item.attrs.mode,
+    }));
+  }
+
+  /**
+   * Raw one-level read over exec (no SFTP). One round trip lists the dir and
+   * stats every child. The path field (%n) is last so spaces/`|` in names stay
+   * intact — only the first three `|` are significant. Filenames containing a
+   * literal newline are not supported (line-based parsing); acceptable for the
+   * embedded targets this path serves.
+   */
+  private async readdirExec(dir: string): Promise<DirEntry[]> {
+    const cmd =
+      `find ${shQuote(dir)} -maxdepth 1 -mindepth 1 ` +
+      `-exec stat -c '%F|%s|%Y|%n' -- {} ';'`;
+    const out = await this.run(cmd);
+    const entries: DirEntry[] = [];
+    for (const line of out.split('\n')) {
+      if (!line) continue;
+      const i1 = line.indexOf('|');
+      const i2 = line.indexOf('|', i1 + 1);
+      const i3 = line.indexOf('|', i2 + 1);
+      if (i1 < 0 || i2 < 0 || i3 < 0) continue;
+      const desc = line.slice(0, i1);
+      const size = line.slice(i1 + 1, i2);
+      const mtime = line.slice(i2 + 1, i3);
+      const full = line.slice(i3 + 1);
+      entries.push({
+        name: this.path.basename(full),
+        path: full,
+        type: fileTypeFromStat(desc),
+        size: Number(size) || 0,
+        mtime: mtime ? Number(mtime) * 1000 : null,
+        mode: 0,
+      });
+    }
+    return entries;
+  }
+
   async readFile(p: string): Promise<Buffer> {
     const target = await this.expandHome(p);
+    if (this.execOnly) {
+      const ch = await this.session.execChannel(`cat -- ${shQuote(target)}`);
+      return new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        let stderr = '';
+        ch.on('data', (c: Buffer) => chunks.push(c));
+        ch.stderr.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
+        ch.on('error', reject);
+        ch.on('close', (code: number | string) => {
+          const c = Number(code) || 0;
+          if (c !== 0) {
+            return reject(new SshConnectionError(this.session.endpoint.id, stderr.trim() || `cat exit ${c}`));
+          }
+          resolve(Buffer.concat(chunks));
+        });
+      });
+    }
     const sftp = await this.sftp();
     return new Promise<Buffer>((resolve, reject) => {
       const chunks: Buffer[] = [];
@@ -134,6 +236,23 @@ export class RemoteFs {
   async writeFile(p: string, data: Buffer | string): Promise<void> {
     const target = await this.expandHome(p);
     const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+    if (this.execOnly) {
+      const ch = await this.session.execChannel(`cat > ${shQuote(target)}`);
+      ch.resume(); // drain empty stdout so 'close' fires after stdin EOF
+      return new Promise<void>((resolve, reject) => {
+        let stderr = '';
+        ch.stderr.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
+        ch.on('error', reject);
+        ch.on('close', (code: number | string) => {
+          const c = Number(code) || 0;
+          if (c !== 0) {
+            return reject(new SshConnectionError(this.session.endpoint.id, stderr.trim() || `cat exit ${c}`));
+          }
+          resolve();
+        });
+        ch.end(buf);
+      });
+    }
     const sftp = await this.sftp();
     return new Promise<void>((resolve, reject) => {
       const stream = sftp.createWriteStream(target);
@@ -145,6 +264,10 @@ export class RemoteFs {
 
   async mkdirp(p: string): Promise<void> {
     const target = await this.expandHome(p);
+    if (this.execOnly) {
+      await this.run(`mkdir -p -- ${shQuote(target)}`);
+      return;
+    }
     const sftp = await this.sftp();
     const parts = this.path.split(target);
     const absolute = this.path.isAbsolute(target);
@@ -168,6 +291,10 @@ export class RemoteFs {
   async rename(from: string, to: string): Promise<void> {
     const src = await this.expandHome(from);
     const dst = await this.expandHome(to);
+    if (this.execOnly) {
+      await this.run(`mv -- ${shQuote(src)} ${shQuote(dst)}`);
+      return;
+    }
     const sftp = await this.sftp();
     return new Promise<void>((resolve, reject) => {
       sftp.rename(src, dst, (err) => (err ? reject(err) : resolve()));
@@ -176,6 +303,10 @@ export class RemoteFs {
 
   async remove(p: string): Promise<void> {
     const target = await this.expandHome(p);
+    if (this.execOnly) {
+      await this.run(`rm -rf -- ${shQuote(target)}`);
+      return;
+    }
     const st = await this.stat(target);
     if (st.type === 'dir') {
       await this.removeDir(target);

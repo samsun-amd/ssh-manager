@@ -10,6 +10,7 @@ const DEFAULT_READY_TIMEOUT = 15000;
 const DEFAULT_IDLE_TIMEOUT = 60000;
 const DEFAULT_MAX_PER_KEY = 4;
 const EXEC_TIMEOUT = 15000;
+const SFTP_PROBE_TIMEOUT = 6000;
 
 /** A live, OS-detected SSH session. Wraps an ssh2 Client (+ optional jump). */
 export class SshSession {
@@ -18,6 +19,7 @@ export class SshSession {
   private readonly jumpClient: Client | null;
   private cachedOs: RemoteOs | null;
   private sftpWrapper: SFTPWrapper | null = null;
+  private sftpAvailable_: boolean | null = null;
   /** Set by the pool; identifies the bucket this session belongs to. */
   poolKey = '';
 
@@ -30,6 +32,15 @@ export class SshSession {
 
   get os(): RemoteOs | null {
     return this.cachedOs;
+  }
+
+  /**
+   * Whether this endpoint's sshd exposes an SFTP subsystem. null until probed
+   * by checkSftp(). Embedded sshds (e.g. a BusyBox SMC) often ship no
+   * sftp-server, so callers must fall back to plain exec streaming there.
+   */
+  get sftpAvailable(): boolean | null {
+    return this.sftpAvailable_;
   }
 
   /** Get (and cache) an SFTP channel for this session. */
@@ -110,6 +121,55 @@ export class SshSession {
       this.cachedOs = 'windows';
     }
     return this.cachedOs;
+  }
+
+  /**
+   * Probe (once, cached) whether the remote sshd offers an SFTP subsystem.
+   * Races an sftp() open against a short timeout so a server that silently
+   * refuses the subsystem cannot hang the pool. A dead probe channel is torn
+   * down. For jumped endpoints this.client is already the tunneled inner
+   * client, so the probe naturally traverses the jump.
+   */
+  async checkSftp(): Promise<boolean> {
+    if (this.sftpAvailable_ !== null) return this.sftpAvailable_;
+    const available = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (val: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(val);
+      };
+      const timer = setTimeout(() => finish(false), SFTP_PROBE_TIMEOUT);
+      this.client.sftp((err, sftp) => {
+        if (err) return finish(false);
+        // Cache the wrapper so the first real sftp() call reuses it.
+        this.sftpWrapper = sftp;
+        const drop = () => {
+          if (this.sftpWrapper === sftp) this.sftpWrapper = null;
+        };
+        sftp.on('close', drop);
+        sftp.on('error', drop);
+        finish(true);
+      });
+    });
+    this.sftpAvailable_ = available;
+    return available;
+  }
+
+  /**
+   * Open a raw, unbuffered exec channel and hand back the live duplex stream.
+   * Unlike exec(), this does not buffer stdout or impose an inactivity timeout
+   * — the caller drives data/close. Used for binary-safe streaming on
+   * endpoints without SFTP (`cat` to read, `cat > file` to write).
+   */
+  execChannel(command: string): Promise<ClientChannel> {
+    return new Promise((resolve, reject) => {
+      this.client.exec(command, (err, stream: ClientChannel) => {
+        if (err) return reject(new SshConnectionError(this.endpoint.id, `exec failed: ${err.message}`, err));
+        resolve(stream);
+      });
+    });
   }
 
   /** True if the underlying transport still appears healthy. */
@@ -287,6 +347,7 @@ export class SshPool {
     const session = new SshSession(endpoint, client, jumpClient);
     session.poolKey = key;
     await session.detectOs();
+    await session.checkSftp();
 
     // closeAll() may have run while we were awaiting connect/detectOs. The new
     // session is not yet in any bucket, so closeAll() could not have reached it;
