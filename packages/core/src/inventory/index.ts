@@ -61,16 +61,14 @@ export class Inventory {
       if (n.type === 'client') {
         return { num, type: 'Client', name: n.name, endpoint: endpointStr(n.ip, n.port) };
       }
-      if (n.type === 'smc') {
-        return { num, type: 'SMC', name: n.name, endpoint: `${endpointStr(n.ip, n.port)} (via BMC)` };
-      }
       if (n.type === 'server') {
         const hosts = (n.hosts || []).map((h) => endpointStr(h.ip, h.port)).join(',');
+        const smc = n.smc ? `, SMC: ${endpointStr(n.smc.ip, n.smc.port)} (via BMC)` : '';
         return {
           num,
           type: 'Server',
           name: n.name,
-          endpoint: `BMC: ${endpointStr(n.bmc?.ip, n.bmc?.port)}, Hosts: ${hosts}`,
+          endpoint: `BMC: ${endpointStr(n.bmc?.ip, n.bmc?.port)}, Hosts: ${hosts}${smc}`,
         };
       }
       return { num, type: 'Unknown', name: n.name || 'unnamed', endpoint: 'Unsupported' };
@@ -90,19 +88,14 @@ export class Inventory {
     return null;
   }
 
-  /** Locate the singleton SMC node, used as the smc target behind a BMC jump. */
-  private findSmcNode(): InventoryNode | null {
-    return this.nodes.find((n) => n.type === 'smc') || null;
-  }
-
   /**
    * Resolve a selector (+ optional sub-target) into an Endpoint, mirroring sshm:
    *   resolve("client")            -> client direct
    *   resolve("3")                 -> 3rd node, default connection
    *   resolve("1.2.3.4")           -> IP search across client/smc/bmc/hosts
    *   resolve("server1", "bmc")    -> the BMC directly
-   *   resolve("server1", "host2")  -> host #2 via BMC jump
-   *   resolve("server1", "smc")    -> the SMC node via this server's BMC jump
+   *   resolve("server1", "host2")  -> host #2 directly (no jump)
+   *   resolve("server1", "smc")    -> this server's embedded SMC via its BMC jump
    */
   resolve(selector: string, sub?: string): Endpoint {
     // IP search has no sub-target.
@@ -128,10 +121,9 @@ export class Inventory {
     if (sub === 'smc') {
       const jump = credsFrom(node.bmc);
       if (!jump) throw new Error(`'${label}' is not a server with BMC; SMC needs a BMC jump`);
-      const smc = this.findSmcNode();
-      const conn = credsFrom(smc || undefined);
-      if (!conn) throw new Error('No SMC node found in inventory');
-      return { id: `${label}/smc`, conn, jump, os: smc?.os };
+      const conn = credsFrom(node.smc);
+      if (!conn) throw new Error(`'${label}' has no embedded SMC`);
+      return { id: `${label}/smc`, conn, jump, os: node.smc?.os };
     }
 
     const hostMatch = /^host([0-9]+)$/.exec(sub);
@@ -140,9 +132,9 @@ export class Inventory {
       const host = node.hosts && node.hosts[hi];
       const conn = credsFrom(host);
       if (!conn) throw new Error(`${label} ${sub} not defined`);
-      // Hosts sit behind the BMC; use it as a jump when present.
-      const jump = credsFrom(node.bmc) || undefined;
-      return { id: `${label}/${sub}`, conn, jump, os: host?.os };
+      // Hosts are reachable directly (their ip is a routable address); only the
+      // SMC sits on an internal net behind the BMC jump.
+      return { id: `${label}/${sub}`, conn, os: host?.os };
     }
 
     throw new Error(`Unknown sub-target '${sub}' for '${label}'`);
@@ -154,22 +146,23 @@ export class Inventory {
         const conn = credsFrom(node);
         if (conn) return { id: node.name, conn, os: node.os };
       }
-      if (node.type === 'smc' && node.ip === ip) {
-        const conn = credsFrom(node);
-        if (conn) return { id: node.name, conn, os: node.os };
-      }
       if (node.type === 'server') {
         if (node.bmc?.ip === ip) {
           const conn = credsFrom(node.bmc);
           if (conn) return { id: `${node.name}/bmc`, conn, os: node.bmc?.os };
+        }
+        if (node.smc?.ip === ip) {
+          const conn = credsFrom(node.smc);
+          const jump = credsFrom(node.bmc) || undefined;
+          if (conn) return { id: `${node.name}/smc`, conn, jump, os: node.smc?.os };
         }
         for (let h = 0; h < (node.hosts?.length || 0); h += 1) {
           const host = node.hosts![h];
           if (host.ip === ip) {
             const conn = credsFrom(host);
             if (conn) {
-              const jump = credsFrom(node.bmc) || undefined;
-              return { id: `${node.name}/host${h + 1}`, conn, jump, os: host.os };
+              // Hosts connect directly; no BMC jump.
+              return { id: `${node.name}/host${h + 1}`, conn, os: host.os };
             }
           }
         }
@@ -184,7 +177,7 @@ export class Inventory {
  * server uses its BMC.
  */
 function defaultEndpoint(node: InventoryNode, label: string): Endpoint {
-  if (node.type === 'client' || node.type === 'smc') {
+  if (node.type === 'client') {
     const conn = credsFrom(node);
     if (!conn) throw new Error(`Incomplete connection config for '${label}'`);
     return { id: label, conn, os: node.os };

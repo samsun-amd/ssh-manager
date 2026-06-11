@@ -23,9 +23,18 @@ export interface Endpoint {
   os?: RemoteOs;
 }
 
-/** A raw entry in ssh_remote.json (subset of fields we read). */
+/** A single credential block (a connectable target inside a node). */
+export interface CredBlock {
+  ip: string;
+  user: string;
+  pass?: string;
+  port?: number;
+  os?: RemoteOs;
+}
+
+/** A raw inventory entry. A server bundles its BMC, optional SMC, and hosts. */
 export interface InventoryNode {
-  type: 'client' | 'server' | 'smc';
+  type: 'client' | 'server';
   name: string;
   ip?: string;
   user?: string;
@@ -33,8 +42,10 @@ export interface InventoryNode {
   port?: number;
   os?: RemoteOs;
   note?: string;
-  bmc?: { ip: string; user: string; pass?: string; port?: number; os?: RemoteOs };
-  hosts?: Array<{ ip: string; user: string; pass?: string; port?: number; os?: RemoteOs }>;
+  bmc?: CredBlock;
+  /** SMC reached via this server's BMC jump (same direction as hosts). */
+  smc?: CredBlock;
+  hosts?: CredBlock[];
 }
 
 /** Summary row for listing the inventory (mirrors `sshm -l`). */

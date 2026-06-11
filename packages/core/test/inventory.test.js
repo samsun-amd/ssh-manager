@@ -62,13 +62,11 @@ test('name selector resolves client direct, includes password', () => {
   assert.strictEqual(ep.conn.password, 'secret');
 });
 
-test('IP search for a server host carries the BMC as jump', () => {
+test('IP search for a server host resolves directly (no jump)', () => {
   const ep = inv.resolve('10.0.0.11'); // server1 host1
   assert.strictEqual(ep.id, 'server1/host1');
   assert.strictEqual(ep.conn.host, '10.0.0.11');
-  assert.ok(ep.jump);
-  assert.strictEqual(ep.jump.host, '10.0.0.1');
-  assert.strictEqual(ep.jump.user, 'root');
+  assert.strictEqual(ep.jump, undefined);
 });
 
 test('IP search for a BMC ip resolves to <name>/bmc with no jump', () => {
@@ -105,18 +103,37 @@ test('smc sub on a non-server throws (no BMC jump)', () => {
 test('list() summary shape', () => {
   const rows = inv.list();
   assert.strictEqual(rows.length, fixture.inventory.length);
+  // server1 now carries an embedded SMC, shown inline in the summary.
   assert.deepStrictEqual(rows[0], {
     num: 1,
     type: 'Server',
     name: 'server1',
-    endpoint: 'BMC: 10.0.0.1, Hosts: 10.0.0.11',
+    endpoint: 'BMC: 10.0.0.1, Hosts: 10.0.0.11, SMC: 10.0.0.60 (via BMC)',
   });
   const client = rows.find((r) => r.name === 'client');
   assert.strictEqual(client.type, 'Client');
   assert.strictEqual(client.endpoint, '10.0.0.50');
-  const smc = rows.find((r) => r.name === 'smc');
-  assert.strictEqual(smc.type, 'SMC');
-  assert.match(smc.endpoint, /via BMC/);
+});
+
+test('embedded SMC resolves via the server BMC jump', () => {
+  const ep = inv.resolve('server1', 'smc');
+  assert.strictEqual(ep.id, 'server1/smc');
+  assert.strictEqual(ep.conn.host, '10.0.0.60');
+  assert.ok(ep.jump);
+  assert.strictEqual(ep.jump.host, '10.0.0.1');
+});
+
+test('IP search for an embedded SMC carries the BMC as jump', () => {
+  const ep = inv.resolve('10.0.0.60');
+  assert.strictEqual(ep.id, 'server1/smc');
+  assert.strictEqual(ep.conn.host, '10.0.0.60');
+  assert.ok(ep.jump);
+  assert.strictEqual(ep.jump.host, '10.0.0.1');
+});
+
+test('smc sub on a server without an embedded SMC throws', () => {
+  const ep = () => inv.resolve('server2', 'smc');
+  assert.throws(ep, /no embedded SMC/);
 });
 
 test('raw() returns the underlying nodes', () => {

@@ -5,6 +5,7 @@
       "type": "server",
       "name": "server1",
       "bmc": { "ip": "10.0.0.1", "user": "root", "pass": "0penBmc" },
+      "smc": { "ip": "10.0.0.60", "user": "root", "pass": "0penBmc" },
       "hosts": [{ "ip": "10.0.0.11", "user": "u1", "pass": "p1" }]
     },
     {
@@ -22,13 +23,6 @@
       "ip": "10.0.0.50",
       "user": "alice",
       "pass": "secret"
-    },
-    {
-      "type": "smc",
-      "name": "smc",
-      "ip": "10.0.0.60",
-      "user": "root",
-      "pass": "0penBmc"
     }
   ],
   "cases": [
@@ -59,7 +53,7 @@
       "expect": {
         "id": "server1/host1",
         "conn": { "host": "10.0.0.11", "port": 22, "user": "u1" },
-        "jump": { "host": "10.0.0.1", "port": 22, "user": "root" }
+        "jump": null
       }
     },
     {
@@ -68,7 +62,7 @@
       "expect": {
         "id": "server2/host2",
         "conn": { "host": "10.0.0.22", "port": 2200, "user": "u3" },
-        "jump": { "host": "10.0.0.2", "port": 2222, "user": "root" }
+        "jump": null
       }
     },
     {
@@ -85,7 +79,7 @@
       "expect": {
         "id": "server2/host2",
         "conn": { "host": "10.0.0.22", "port": 2200, "user": "u3" },
-        "jump": { "host": "10.0.0.2", "port": 2222, "user": "root" }
+        "jump": null
       }
     }
   ]
