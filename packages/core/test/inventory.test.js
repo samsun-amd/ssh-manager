@@ -11,10 +11,10 @@ const { Inventory, adhocEndpoint, resolveInventoryPath } = require('../dist/inde
 const FIXTURE_PATH = path.join(__dirname, '..', '..', '..', 'shared', 'inventory-conformance.json');
 const fixture = JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf8'));
 
-/** Write an inventory array to a temp file and load it. */
+/** Write a group config to a temp file and load its nodes. */
 function loadFrom(nodes) {
   const file = path.join(os.tmpdir(), `inv-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
-  fs.writeFileSync(file, JSON.stringify(nodes), 'utf8');
+  fs.writeFileSync(file, JSON.stringify({ group_number: 0, nodes }), 'utf8');
   try {
     return Inventory.load(file);
   } finally {
@@ -181,12 +181,59 @@ test('resolveInventoryPath honors SSH_REMOTE_JSON env', () => {
   }
 });
 
-test('Inventory.load throws on non-array JSON', () => {
+test('Inventory.load throws on an invalid group object', () => {
   const file = path.join(os.tmpdir(), `bad-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({ not: 'array' }));
   try {
-    assert.throws(() => Inventory.load(file), /must be a JSON array/);
+    assert.throws(() => Inventory.load(file), /must be \{group_number:/);
   } finally {
     fs.rmSync(file, { force: true });
+  }
+});
+
+test('group format validates metadata and preserves the node API', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'core-groups-'));
+  const file = path.join(dir, 'ssh_remote_tw.json');
+  try {
+    fs.writeFileSync(file, JSON.stringify({ group_number: 1, nodes: fixture.inventory }));
+    const loaded = Inventory.load(file);
+    assert.deepStrictEqual(loaded.raw(), fixture.inventory);
+    assert.strictEqual(loaded.resolve('server1', 'smc').jump.host, '10.0.0.1');
+    for (const invalid of [fixture.inventory, null, {},
+      { group_number: -1, nodes: [] }, { group_number: 1.5, nodes: [] },
+      { group_number: '1', nodes: [] }, { group_number: 9007199254740992, nodes: [] },
+      { group_number: 1, nodes: [null] }, { group_number: 1, nodes: [[]] }]) {
+      fs.writeFileSync(file, JSON.stringify(invalid));
+      assert.throws(() => Inventory.load(file), /convert legacy arrays/);
+    }
+    fs.writeFileSync(file, JSON.stringify({ group_number: 0, nodes: [] }));
+    assert.throws(() => Inventory.load(file), /Group 0 is reserved/);
+    const defaultFile = path.join(dir, 'ssh_remote_default.json');
+    fs.writeFileSync(defaultFile, JSON.stringify({ group_number: 1, nodes: [] }));
+    assert.throws(() => Inventory.load(defaultFile), /Group 0 is reserved/);
+    fs.writeFileSync(defaultFile, JSON.stringify({ group_number: 0, nodes: [] }));
+    assert.deepStrictEqual(Inventory.load(defaultFile).raw(), []);
+    // Inline consumer inventories remain arrays passed to the constructor.
+    assert.deepStrictEqual(new Inventory(fixture.inventory).raw(), fixture.inventory);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('default config path and environment override precedence', () => {
+  const previous = { SSH_REMOTE_JSON: process.env.SSH_REMOTE_JSON, SSHM_CONFIG_DIR: process.env.SSHM_CONFIG_DIR };
+  try {
+    delete process.env.SSH_REMOTE_JSON;
+    delete process.env.SSHM_CONFIG_DIR;
+    assert.strictEqual(resolveInventoryPath(), path.join(os.homedir(), 'sshm_config', 'ssh_remote_default.json'));
+    process.env.SSHM_CONFIG_DIR = path.join(os.tmpdir(), 'custom-configs');
+    assert.strictEqual(resolveInventoryPath(), path.join(process.env.SSHM_CONFIG_DIR, 'ssh_remote_default.json'));
+    process.env.SSH_REMOTE_JSON = path.join(os.tmpdir(), 'explicit.json');
+    assert.strictEqual(resolveInventoryPath(), process.env.SSH_REMOTE_JSON);
+    assert.strictEqual(resolveInventoryPath('argument.json'), 'argument.json');
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
   }
 });

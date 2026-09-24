@@ -1,13 +1,12 @@
 {
-  "group_number": 0,
+  "group_number": 2,
   "nodes": [
     {
       "type": "client",
       "name": "client",
       "ip": "192.0.2.1",
       "user": "test",
-      "port": 2201,
-      "pass": "client secret"
+      "port": 2201
     },
     {
       "type": "server",
@@ -15,8 +14,7 @@
       "bmc": {
         "ip": "192.0.2.2",
         "user": "gateway",
-        "port": 2202,
-        "pass": "jump secret"
+        "port": 2202
       },
       "hosts": [
         {
@@ -31,8 +29,7 @@
       "name": "smc",
       "ip": "192.0.2.4",
       "user": "root",
-      "port": 2204,
-      "pass": "smc secret"
+      "port": 2204
     }
   ]
 }

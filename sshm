@@ -2,8 +2,8 @@
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_PRIVATE_CONFIG="$HOME/note/ssh_remote.json"
-EXAMPLE_CONFIG="$SCRIPT_DIR/ssh_remote.json"
+CONFIG_DIR="${SSHM_CONFIG_DIR:-$HOME/sshm_config}"
+DEFAULT_PRIVATE_CONFIG="$CONFIG_DIR/ssh_remote_default.json"
 DEFAULT_SSH_PORT=22
 
 # Directory transfer tuning (all overridable via environment).
@@ -19,13 +19,7 @@ SSHM_NO_COMPRESS="${SSHM_NO_COMPRESS:-0}"              # 1 = never gzip the tar 
 # wastes CPU for negligible size gain, so the tar stream skips gzip for them.
 ALREADY_COMPRESSED_EXT="gz tgz bz2 tbz2 xz txz zst zip 7z rar lz4 jpg jpeg png gif webp heic mp4 mkv mov avi webm mp3 flac ogg opus aac pdf apk deb rpm jar"
 
-if [[ -n "${SSHM_CONFIG:-}" ]]; then
-    JSON_FILE="$SSHM_CONFIG"
-elif [[ -r "$DEFAULT_PRIVATE_CONFIG" ]]; then
-    JSON_FILE="$DEFAULT_PRIVATE_CONFIG"
-else
-    JSON_FILE="$EXAMPLE_CONFIG"
-fi
+JSON_FILE="${SSHM_CONFIG:-$DEFAULT_PRIVATE_CONFIG}"
 
 # Dependency Check
 for cmd in jq sshpass; do
@@ -47,33 +41,229 @@ shell_quote() {
     printf "%q" "$1"
 }
 
+# Only this boundary reads the file; selectors work on the normalized node array.
 validate_config() {
-    if [[ ! -f "$JSON_FILE" ]]; then
-        print_error "Config file not found: $JSON_FILE"
-        echo "Set SSHM_CONFIG=/path/to/ssh_remote.json or create $DEFAULT_PRIVATE_CONFIG." >&2
-        exit 1
+    if [[ ! -f "$JSON_FILE" || ! -r "$JSON_FILE" ]]; then
+        print_error "Config file not found or unreadable: $JSON_FILE"
+        echo "Create $DEFAULT_PRIVATE_CONFIG or convert a legacy inventory with convert_legacy_config.sh." >&2
+        return 1
     fi
-
-    if [[ ! -r "$JSON_FILE" ]]; then
-        print_error "Config file is not readable: $JSON_FILE"
-        exit 1
+    if ! INVENTORY=$(jq -ecs '
+        if length != 1 then error("one document required") else .[0] end |
+        select(type == "object") |
+        select(.group_number | type == "number" and . >= 0 and . <= 9007199254740991 and floor == .) |
+        select(.nodes | type == "array" and all(.[]; type == "object")) |
+        .nodes
+    ' -- "$JSON_FILE" 2>/dev/null); then
+        print_error "Invalid config: $JSON_FILE. Expected {group_number: integer, nodes: array}; convert legacy arrays with convert_legacy_config.sh."
+        return 1
     fi
-
-    if ! jq -e 'type == "array"' "$JSON_FILE" > /dev/null; then
-        print_error "Config file must be a valid JSON array: $JSON_FILE"
-        exit 1
+    local base=${JSON_FILE##*/} number
+    number=$(jq -r '.group_number' -- "$JSON_FILE")
+    if [[ "$base" == ssh_remote_default.json && "$number" != 0 ]] ||
+       [[ "$base" == ssh_remote_*.json && "$base" != ssh_remote_default.json && "$number" == 0 ]]; then
+        print_error "Group 0 is reserved for ssh_remote_default.json: $JSON_FILE"
+        return 1
     fi
 }
 
+inventory_jq() {
+    jq "$@" <<< "$INVENTORY"
+}
+
+scan_configs() {
+    local file name info
+    local rows=()
+    for file in "$CONFIG_DIR"/ssh_remote_*.json; do
+        [[ -e "$file" || -L "$file" ]] || continue
+        name=${file##*/ssh_remote_}
+        name=${name%.json}
+        info='{"number":null,"valid":false}'
+        if [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ && ! "$name" =~ ^[0-9]+$ ]]; then
+            info=$(jq -ecs --arg name "$name" '
+                if length != 1 then error("one document required") else .[0] end |
+                select(type == "object") |
+                .group_number as $n |
+                {number: (if ($n | type == "number" and . >= 0 and . <= 9007199254740991 and floor == .)
+                    and (($name == "default" and $n == 0) or ($name != "default" and $n > 0))
+                    then $n else null end),
+                 valid: (.nodes | type == "array" and all(.[]; type == "object"))} |
+                .valid = (.valid and .number != null)
+            ' -- "$file" 2>/dev/null) || info='{"number":null,"valid":false}'
+        fi
+        rows+=("$(jq -nc --arg name "$name" --arg file "$file" --argjson info "$info" '$info + {name:$name,file:$file}')")
+    done
+    CONFIG_CATALOG=$(printf '%s\n' "${rows[@]}" | jq -s 'sort_by(.number == null, .number, .name)')
+    jq -r '.[] | select(.valid | not) | "Warning: Invalid config: \(.file)"' <<< "$CONFIG_CATALOG" >&2
+    jq -r 'map(select(.number != null)) | group_by(.number)[] | select(length > 1) |
+        "Warning: Duplicate group number \(.[0].number): \(map(.name) | join(", ")). Select by name."' <<< "$CONFIG_CATALOG" >&2
+}
+
+list_configs() {
+    if [[ "$CONFIG_CATALOG" == '[]' ]]; then
+        print_error "No configs found in $CONFIG_DIR"
+        return 1
+    fi
+    {
+        printf 'GroupNo|Group|Config|Status\n'
+        jq -r '. as $all | .[] | . as $row |
+            [(.number // "?"), .name, (.file | split("/")[-1]),
+             (if .valid then "OK" else "INVALID" end) +
+             (if .number != null and ([$all[] | select(.number == $row.number)] | length) > 1
+              then " DUPLICATE" else "" end)] | join("|")' <<< "$CONFIG_CATALOG"
+    } | column -t -s '|'
+}
+
+select_group() {
+    local group=$1 matches
+    if [[ "$group" =~ ^[0-9]+$ ]]; then
+        group=$(sed 's/^0*//' <<< "$group")
+        group=${group:-0}
+        matches=$(jq --arg group "$group" '[.[] | select(.number != null and (.number | tostring) == $group)]' <<< "$CONFIG_CATALOG")
+    else
+        matches=$(jq --arg group "$group" '[.[] | select(.name == $group)]' <<< "$CONFIG_CATALOG")
+    fi
+    if [[ $(jq length <<< "$matches") != 1 ]]; then
+        print_error "Group '$1' not found or ambiguous: $(jq -r 'map(.name) | join(", ")' <<< "$matches")"
+        return 1
+    fi
+    if ! jq -e '.[0].valid' <<< "$matches" >/dev/null; then
+        print_error "Invalid config for group '$1'."
+        return 1
+    fi
+    JSON_FILE=$(jq -r '.[0].file' <<< "$matches")
+}
+
+print_inventory() {
+    # Combine Header and Data into a single stream for 'column'
+    (
+        echo "Num|Type|Name|IP(s)"
+        echo "---|---|---|---"
+        inventory_jq -r '
+            def port($node): ($node.port // 22);
+            def endpoint($node): if ((port($node) | tostring) == "22") then $node.ip else "\($node.ip):\(port($node))" end;
+            to_entries | .[] |
+            if .value.type == "client" then
+                "\(.key + 1)|Client|\(.value.name)|\(endpoint(.value))"
+            elif .value.type == "smc" then
+                "\(.key + 1)|SMC|\(.value.name)|\(endpoint(.value)) (via BMC)"
+            elif .value.type == "server" then
+                "\(.key + 1)|Server|\(.value.name)|BMC: \(endpoint(.value.bmc)), Hosts: \((.value.hosts // []) | map(endpoint(.)) | join(","))"
+            else
+                "\(.key + 1)|Unknown|\(.value.name // "unnamed")|Unsupported node type"
+            end
+        '
+    ) | column -t -s '|'
+}
+
+# Probe through the normal CLI selector and transport, with a bounded child process.
+qa_result() {
+    local status=$4
+    printf '%-18s %-28s %-8s %-20s %s\n' "$1" "$2" "$3" "$status" "$5"
+    qa_total=$((qa_total + 1))
+    if [[ "$status" == PASS ]]; then qa_passed=$((qa_passed + 1)); fi
+}
+
+qa_probe() {
+    local group=$1 label=$2 number=$3 sub=$4 code=0 status detail
+    local args=("$number")
+    [[ -z "$sub" ]] || args+=("$sub")
+    SSHM_CONFIG="$JSON_FILE" SSHM_QA_PROBE=1 TMPDIR="$qa_tmp" LC_ALL=C \
+        timeout -k 2 "$SSHM_QA_TIMEOUT" bash "$SCRIPT_DIR/sshm" \
+        -c "printf 'SSHM_QA_OK\\n'" "${args[@]}" </dev/null > "$qa_tmp/output" 2>&1 || code=$?
+    if [[ "$code" == 0 ]] && grep -Fxq 'SSHM_QA_OK' "$qa_tmp/output"; then
+        status=PASS; detail='SSH and read-only command OK'
+    elif [[ "$code" == 124 || "$code" == 137 ]] || stderr_matches "$qa_tmp/output" 'Connection timed out|Operation timed out'; then
+        status=TIMEOUT; detail="Probe exceeded ${SSHM_QA_TIMEOUT}s or SSH timed out"
+    elif stderr_matches "$qa_tmp/output" 'SSH authentication failed|Permission denied|Authentication failed|invalid/incorrect password'; then
+        status=AUTH_FAILED; detail='SSH authentication failed'
+    elif stderr_matches "$qa_tmp/output" 'Connection refused'; then
+        status=CONNECTION_REFUSED; detail='SSH connection refused'
+    elif [[ "$code" == 255 ]] || stderr_matches "$qa_tmp/output" 'SSH connection failed'; then
+        status=CONNECT_FAILED; detail='SSH connection or jump failed'
+    elif stderr_matches "$qa_tmp/output" 'Error: (Invalid SSH port|Invalid config|Incomplete connection config|Unsupported node type|No SMC|Config file)|not defined|not a server'; then
+        status=CONFIG_ERROR; detail='Invalid node or sub-target configuration'
+    elif stderr_matches "$qa_tmp/output" 'Invalid command|Unknown command|command not found|not recognized|not supported|not permitted'; then
+        status=COMMAND_UNSUPPORTED; detail='SSH responded; probe command unsupported'
+    else
+        status=COMMAND_FAILED; detail="Probe output not confirmed (exit $code)"
+    fi
+    qa_result "$group" "$label" "${sub:-client}" "$status" "$detail"
+}
+
+run_live_qa() (
+    local entry group node number name type sub host_count i smc_count server_count
+    local targets=()
+    local qa_total=0 qa_passed=0 qa_tmp
+    SSHM_QA_TIMEOUT=${SSHM_QA_TIMEOUT:-15}
+    if [[ ! "$SSHM_QA_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]] || (( SSHM_QA_TIMEOUT > 300 )); then
+        print_error 'SSHM_QA_TIMEOUT must be an integer from 1 to 300 seconds.'
+        exit 1
+    fi
+    for name in timeout ssh; do
+        command -v "$name" >/dev/null || { print_error "'$name' is required for -qa."; exit 1; }
+    done
+    [[ "$CONFIG_CATALOG" != '[]' ]] || { print_error "No configs found in $CONFIG_DIR"; exit 1; }
+    umask 077
+    qa_tmp=$(mktemp -d "${TMPDIR:-/tmp}/sshm_qa_probe.XXXXXX") || exit 1
+    trap 'rm -rf -- "$qa_tmp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf '%-18s %-28s %-8s %-20s %s\n' Group Node Target Status Detail
+    while IFS= read -r entry; do
+        group=$(jq -r '"\(.name) (\(.number // "?"))"' <<< "$entry")
+        JSON_FILE=$(jq -r .file <<< "$entry")
+        if ! jq -e .valid <<< "$entry" >/dev/null || ! validate_config; then
+            qa_result "$group" '-' '-' CONFIG_ERROR 'Invalid config; remaining groups continue'
+            continue
+        fi
+        if [[ $(inventory_jq length) == 0 ]]; then
+            qa_result "$group" '-' '-' CONFIG_ERROR 'Config contains no targets'
+            continue
+        fi
+        smc_count=$(inventory_jq '[.[] | select(.type == "smc")] | length')
+        server_count=$(inventory_jq '[.[] | select(.type == "server")] | length')
+        while IFS= read -r node; do
+            number=$(jq -r '.key + 1' <<< "$node")
+            name=$(jq -r '.value.name // "<unnamed>"' <<< "$node" | tr '\t\r\n' '   ')
+            type=$(jq -r '.value.type // ""' <<< "$node")
+            targets=('')
+            if [[ "$type" == smc ]]; then
+                # Standalone SMC credentials are exercised once per server BMC.
+                if [[ "$server_count" == 0 ]]; then
+                    qa_result "$group" "$number:$name" smc CONFIG_ERROR 'SMC requires a server BMC jump host'
+                fi
+                continue
+            elif [[ "$type" == server ]]; then
+                targets=(bmc)
+                host_count=$(jq -r '.value.hosts | if . == null then 0 elif type == "array" then length else -1 end' <<< "$node")
+                if (( host_count < 0 )); then
+                    qa_result "$group" "$number:$name" hosts CONFIG_ERROR 'hosts must be an array'
+                fi
+                for ((i=1; i<=host_count; i++)); do targets+=("host$i"); done
+                (( smc_count == 0 )) || targets+=(smc)
+            fi
+            for sub in "${targets[@]}"; do qa_probe "$group" "$number:$name" "$number" "$sub"; done
+        done < <(inventory_jq -c 'to_entries[]')
+    done < <(jq -c '.[]' <<< "$CONFIG_CATALOG")
+    printf '\nSummary: total=%s passed=%s failed=%s\n' "$qa_total" "$qa_passed" "$((qa_total - qa_passed))"
+    [[ "$qa_total" -gt 0 && "$qa_total" == "$qa_passed" ]]
+)
+
 build_proxy_command() {
     local ju=$1 jp=$2 ji=$3 jport=${4:-$DEFAULT_SSH_PORT}
+    local qa_options=''
+    if [[ "${SSHM_QA_PROBE:-0}" == 1 ]]; then
+        qa_options=' -o ConnectionAttempts=1 -o NumberOfPasswordPrompts=1'
+        [[ -n "$jp" && "$jp" != null ]] || qa_options+=' -o BatchMode=yes'
+    fi
 
     if [[ -n "$jp" && "$jp" != "null" ]]; then
-        printf "sshpass -p %q ssh -p %q -W %%h:%%p -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR %q@%q" \
-            "$jp" "$jport" "$ju" "$ji"
+        printf "sshpass -p %q ssh -p %q -W %%h:%%p -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR%s %q@%q" \
+            "$jp" "$jport" "$qa_options" "$ju" "$ji"
     else
-        printf "ssh -p %q -W %%h:%%p -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR %q@%q" \
-            "$jport" "$ju" "$ji"
+        printf "ssh -p %q -W %%h:%%p -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR%s %q@%q" \
+            "$jport" "$qa_options" "$ju" "$ji"
     fi
 }
 
@@ -328,10 +518,17 @@ print_usage() {
     echo "  -c    Execute a remote command instead of opening interactive shell"
     echo "  -s    SCP file transfer mode (requires source and destination)"
     echo "  -h    Print this help message"
-    echo "  -l    List all nodes"
+    echo "  -l    List nodes in the selected config"
+    echo "  -g <name|number> Select a config group (default or 0 selects default)"
+    echo "  -g    List config groups without connecting"
+    echo "  -al   List nodes from all config groups"
+    echo "  -qa   Check SSH and read-only commands in all groups (or the group selected by -g)"
     echo ""
     echo "Environment:"
     echo "  SSHM_CONFIG          Override the JSON inventory path"
+    echo "  SSHM_CONFIG_DIR      Config directory (default: ~/sshm_config)"
+    echo "                       Explicit -g takes precedence over SSHM_CONFIG"
+    echo "  SSHM_QA_TIMEOUT      Per-target -qa timeout in seconds (default: 15, max: 300)"
     echo "  SSHM_PROGRESS        auto (default) shows a pv progress bar for directory"
     echo "                       transfers when pv is installed; set to 'off' to disable"
     echo "  SSHM_TAR_THRESHOLD   Directory size in bytes at/above which the tar stream is"
@@ -392,6 +589,10 @@ do_ssh() {
     fi
 
     local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p "$port")
+    if [[ "${SSHM_QA_PROBE:-0}" == 1 ]]; then
+        ssh_opts+=(-o ConnectionAttempts=1 -o NumberOfPasswordPrompts=1)
+        [[ -n "$p" && "$p" != null ]] || ssh_opts+=(-o BatchMode=yes)
+    fi
     if [[ -n "$ji" ]]; then
         ssh_opts+=(-o "ProxyCommand=$(build_proxy_command "$ju" "$jp" "$ji" "$jport")")
     fi
@@ -694,11 +895,32 @@ SCP_MODE="false"
 SCP_SOURCE=""
 SCP_DEST=""
 PORT_OVERRIDE=""
+GROUP_SET=false
+GROUP_LIST=false
+GROUP=""
+ALL_LIST=false
+QA_MODE=false
 ARGS=()
 
 # Process flags first
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -g)
+            if [[ "$GROUP_SET" == true ]]; then
+                print_error "-g may only be specified once."
+                exit 1
+            fi
+            GROUP_SET=true
+            shift
+            if [[ $# -eq 0 || "$1" == -* ]]; then
+                GROUP_LIST=true
+            else
+                GROUP=$1
+                shift
+            fi
+            ;;
+        -al) ALL_LIST=true; shift ;;
+        -qa) QA_MODE=true; shift ;;
         -p) PING_CHECK="true"; shift ;;
         -P|--port)
             if [[ $# -lt 2 || -z "${2:-}" ]]; then
@@ -751,9 +973,52 @@ set -- "${ARGS[@]}"
 
 # --- Main Logic ---
 
+if [[ "$QA_MODE" == true ]]; then
+    if [[ $# -ne 0 || "$GROUP_LIST" == true || "$ALL_LIST" == true ||
+          "$REMOTE_COMMAND_SET" == true || "$SCP_MODE" == true ||
+          "$PING_CHECK" == true || -n "$PORT_OVERRIDE" ]]; then
+        print_error '-qa accepts only an optional -g <name|number>; no target or other action flags.'
+        exit 1
+    fi
+    scan_configs
+    if [[ "$GROUP_SET" == true ]]; then
+        select_group "$GROUP" || exit 1
+        CONFIG_CATALOG=$(jq --arg file "$JSON_FILE" '[.[] | select(.file == $file)]' <<< "$CONFIG_CATALOG")
+    fi
+    run_live_qa
+    exit $?
+fi
+
+if [[ "$GROUP_LIST" == true || "$ALL_LIST" == true ]]; then
+    if [[ $# -ne 0 || "$REMOTE_COMMAND_SET" == true || "$SCP_MODE" == true ||
+          "$PING_CHECK" == true || -n "$PORT_OVERRIDE" ||
+          ( "$ALL_LIST" == true && "$GROUP_SET" == true ) ]]; then
+        print_error "Bare -g and -al are standalone listing commands; provide a group for other actions."
+        exit 1
+    fi
+    scan_configs
+    if [[ "$GROUP_LIST" == true ]]; then
+        list_configs
+        exit $?
+    fi
+    [[ "$CONFIG_CATALOG" != '[]' ]] || { print_error "No configs found in $CONFIG_DIR"; exit 1; }
+    while IFS= read -r entry; do
+        printf '\nGroup %s (%s) - %s\n' "$(jq -r '.number // "?"' <<< "$entry")" \
+            "$(jq -r .name <<< "$entry")" "$(jq -r .file <<< "$entry")"
+        if ! jq -e .valid <<< "$entry" >/dev/null; then
+            echo 'INVALID (skipped)'
+            continue
+        fi
+        JSON_FILE=$(jq -r .file <<< "$entry")
+        validate_config || continue
+        print_inventory || exit $?
+    done < <(jq -c '.[]' <<< "$CONFIG_CATALOG")
+    exit 0
+fi
+
 # If no parameters left after parsing flags, show help
-if [[ -z "$1" ]]; then
-    if [[ "$REMOTE_COMMAND_SET" == "true" || "$SCP_MODE" == "true" ]]; then
+if [[ $# -eq 0 ]]; then
+    if [[ "$REMOTE_COMMAND_SET" == "true" || "$SCP_MODE" == "true" || "$GROUP_SET" == true ]]; then
         print_error "A target is required."
         print_usage
         exit 1
@@ -762,7 +1027,9 @@ if [[ -z "$1" ]]; then
     exit 0
 fi
 
-validate_config
+scan_configs
+if [[ "$GROUP_SET" == true ]]; then select_group "$GROUP" || exit 1; fi
+validate_config || exit 1
 
 # 1. LIST COMMAND
 if [[ "$1" == "list" || "$1" == "-l" || "$1" == "--list" ]]; then
@@ -771,25 +1038,7 @@ if [[ "$1" == "list" || "$1" == "-l" || "$1" == "--list" ]]; then
         exit 1
     fi
 
-    # Combine Header and Data into a single stream for 'column'
-    (
-        echo "Num|Type|Name|IP(s)"
-        echo "---|---|---|---"
-        jq -r '
-            def port($node): ($node.port // 22);
-            def endpoint($node): if ((port($node) | tostring) == "22") then $node.ip else "\($node.ip):\(port($node))" end;
-            to_entries | .[] |
-            if .value.type == "client" then
-                "\(.key + 1)|Client|\(.value.name)|\(endpoint(.value))"
-            elif .value.type == "smc" then
-                "\(.key + 1)|SMC|\(.value.name)|\(endpoint(.value)) (via BMC)"
-            elif .value.type == "server" then
-                "\(.key + 1)|Server|\(.value.name)|BMC: \(endpoint(.value.bmc)), Hosts: \((.value.hosts // []) | map(endpoint(.)) | join(","))"
-            else
-                "\(.key + 1)|Unknown|\(.value.name // "unnamed")|Unsupported node type"
-            end
-        ' "$JSON_FILE"
-    ) | column -t -s '|'
+    print_inventory
     exit 0
 fi
 
@@ -804,7 +1053,7 @@ if [[ $# -eq 1 ]]; then
             exit 1
         fi
         idx=$((10#$input - 1))
-        node=$(jq ".[$idx]" "$JSON_FILE")
+        node=$(inventory_jq ".[$idx]")
         [[ "$node" == "null" ]] && { print_error "Node $input not found."; exit 1; }
 
         load_default_connection "$node" "node $input" || exit 1
@@ -813,12 +1062,12 @@ if [[ $# -eq 1 ]]; then
     fi
 
     # B. IP Search
-    found=$(jq -r --arg ip "$input" '
+    found=$(inventory_jq -r --arg ip "$input" '
         (.[] | select(.type=="client" and .ip==$ip) | {u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
         (.[] | select(.type=="smc" and .ip==$ip) | {u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
         (.[] | select(.type=="server") | .bmc | select(.ip==$ip) | {u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
         (.[] | select(.type=="server") | .hosts[]? | select(.ip==$ip) | {u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)})
-    ' "$JSON_FILE")
+    ')
     if [[ -n "$found" ]]; then
         u=$(echo "$found" | jq -r .u)
         p=$(echo "$found" | jq -r .p)
@@ -830,7 +1079,7 @@ if [[ $# -eq 1 ]]; then
     fi
 
     # C. Name
-    node=$(jq -r --arg n "$input" '.[] | select(.name == $n)' "$JSON_FILE")
+    node=$(inventory_jq -r --arg n "$input" '.[] | select(.name == $n)')
     if [[ -n "$node" ]]; then
         load_default_connection "$node" "$input" || exit 1
         run_selected_action "$TARGET_USER" "$TARGET_PASS" "$TARGET_IP" "$TARGET_PORT"
@@ -851,9 +1100,9 @@ if [[ $# -eq 2 ]]; then
             exit 1
         fi
         idx=$((10#$identifier - 1))
-        node=$(jq ".[$idx]" "$JSON_FILE")
+        node=$(inventory_jq ".[$idx]")
     else
-        node=$(jq -r --arg n "$identifier" '.[] | select(.name == $n)' "$JSON_FILE")
+        node=$(inventory_jq -r --arg n "$identifier" '.[] | select(.name == $n)')
     fi
 
     [[ "$node" == "null" || -z "$node" ]] && { print_error "'$identifier' not found."; exit 1; }
@@ -878,7 +1127,7 @@ if [[ $# -eq 2 ]]; then
         fi
         
         # Get SMC information from config
-        smc_node=$(jq -r '.[] | select(.type == "smc")' "$JSON_FILE")
+        smc_node=$(inventory_jq -r '.[] | select(.type == "smc")')
         if [[ -z "$smc_node" ]]; then
             print_error "No SMC node found in configuration."
             exit 1

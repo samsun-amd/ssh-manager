@@ -8,6 +8,7 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 mkdir -p "$TEST_DIR/bin"
 export MOCK_LOG="$TEST_DIR/calls.jsonl" REAL_TAR=$(command -v tar) REAL_GZIP=$(command -v gzip)
 export MOCK_MODE=status MOCK_SCP_EXIT=0 MOCK_SSH_EXIT=0 MOCK_NO_TAR=0 MOCK_FAIL=''
+export SSHM_CONFIG_DIR="$TEST_DIR/configs"
 export SSHM_CONFIG="$SCRIPT_DIR/shared/cli-test-inventory.json" SSHM_PROGRESS=off
 export SSHM_FORCE_COMPRESS=0 SSHM_NO_COMPRESS=0 SSHM_TAR_THRESHOLD=10485760 SSHM_COMPRESSED_RATIO=70
 unset SSHM_TEST_REMOTE

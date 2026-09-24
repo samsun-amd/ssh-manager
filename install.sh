@@ -12,7 +12,7 @@
 #
 # Environment:
 #   PREFIX        Install prefix (default: /usr/local). Binary goes to $PREFIX/bin.
-#   SSHM_CONFIG_DIR   Directory for the private inventory (default: $HOME/note).
+#   SSHM_CONFIG_DIR   Directory for private configs (default: $HOME/sshm_config).
 
 set -euo pipefail
 
@@ -20,9 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="$PREFIX/bin"
-CONFIG_DIR="${SSHM_CONFIG_DIR:-$HOME/note}"
-CONFIG_FILE="$CONFIG_DIR/ssh_remote.json"
-EXAMPLE_CONFIG="$SCRIPT_DIR/ssh_remote.json"
+CONFIG_DIR="${SSHM_CONFIG_DIR:-$HOME/sshm_config}"
+CONFIG_FILE="$CONFIG_DIR/ssh_remote_default.json"
+EXAMPLE_CONFIG="$SCRIPT_DIR/sshm_config/ssh_remote_default.json"
 
 # Runtime dependencies. tar/gzip are required for fast directory transfers,
 # pv is optional but enables progress bars.
@@ -100,10 +100,14 @@ setup_config() {
         return
     fi
 
+    if [[ -f "$HOME/note/ssh_remote.json" ]]; then
+        info "Converting legacy inventory; the original file will be kept"
+        SSHM_CONFIG_DIR="$CONFIG_DIR" bash "$SCRIPT_DIR/convert_legacy_config.sh" "$HOME/note/ssh_remote.json" 0
+        return
+    fi
+
     info "Creating private inventory at $CONFIG_FILE"
-    mkdir -p "$CONFIG_DIR"
-    cp "$EXAMPLE_CONFIG" "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
+    (umask 077; mkdir -p "$CONFIG_DIR"; set -C; cat "$EXAMPLE_CONFIG" > "$CONFIG_FILE")
     warn "Edit $CONFIG_FILE with your real inventory (credentials, IPs)."
 }
 
@@ -120,8 +124,8 @@ verify() {
 
 main() {
     install_dependencies
-    install_binary
     setup_config
+    install_binary
     verify
 }
 

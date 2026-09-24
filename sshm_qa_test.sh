@@ -13,10 +13,8 @@ if [[ -n "${SSHM_CONFIG:-}" ]]; then
     CONFIG_FILE="$SSHM_CONFIG"
 elif [[ "${RUN_SSHM_LIVE_TESTS:-0}" != 1 ]]; then
     CONFIG_FILE="$SCRIPT_DIR/shared/cli-test-inventory.json"
-elif [[ -r "$HOME/note/ssh_remote.json" ]]; then
-    CONFIG_FILE="$HOME/note/ssh_remote.json"
 else
-    CONFIG_FILE="$SCRIPT_DIR/ssh_remote.json"
+    CONFIG_FILE="${SSHM_CONFIG_DIR:-$HOME/sshm_config}/ssh_remote_default.json"
 fi
 
 cleanup_live_dir() {
@@ -191,7 +189,7 @@ skip_test() {
 
 first_jq_value() {
     local query=$1
-    jq -r "$query" "$CONFIG_FILE" | sed -n '1p'
+    jq -r ".nodes | $query" "$CONFIG_FILE" | sed -n '1p'
 }
 
 generate_report() {
@@ -270,8 +268,8 @@ if [[ ! -r "$CONFIG_FILE" ]]; then
     exit 1
 fi
 
-if ! jq -e 'type == "array"' "$CONFIG_FILE" > /dev/null; then
-    echo -e "${RED}Config file must be a valid JSON array: $CONFIG_FILE${NC}" >&2
+if ! jq -e 'type == "object" and (.nodes | type == "array")' "$CONFIG_FILE" > /dev/null; then
+    echo -e "${RED}Config file must be a group object with a nodes array: $CONFIG_FILE${NC}" >&2
     exit 1
 fi
 
@@ -299,6 +297,10 @@ echo ""
 echo -e "${YELLOW}=== OFFLINE TRANSPORT REGRESSION ===${NC}\n"
 run_test "Transport arguments, exit codes, and tar/gzip integrity" success scp \
     timeout 90 bash "$SCRIPT_DIR/sshm_exit_test.sh"
+run_test "Config groups, legacy conversion, and installer" success basic \
+    timeout 90 bash "$SCRIPT_DIR/sshm_config_test.sh"
+run_test "Live QA selection, status classification, and timeouts (mock transport)" success basic \
+    timeout 90 bash "$SCRIPT_DIR/sshm_qa_mode_test.sh"
 
 echo -e "${YELLOW}=== BASIC FUNCTION TESTS ===${NC}\n"
 run_test "Help Display" success basic timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -h

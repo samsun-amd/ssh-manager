@@ -11,14 +11,13 @@ import {
 const DEFAULT_PORT = 22;
 
 /**
- * Resolve the inventory file path, mirroring sshm precedence:
- *   $SSH_REMOTE_JSON  >  ~/note/ssh_remote.json
- * No hardcoded absolute paths (CLAUDE.md portability).
+ * Explicit path > SSH_REMOTE_JSON > the default file in SSHM_CONFIG_DIR
+ * (or ~/sshm_config). Group discovery is a CLI concern.
  */
 export function resolveInventoryPath(explicit?: string): string {
   if (explicit) return explicit;
   if (process.env.SSH_REMOTE_JSON) return process.env.SSH_REMOTE_JSON;
-  return path.join(os.homedir(), 'note', 'ssh_remote.json');
+  return path.join(process.env.SSHM_CONFIG_DIR || path.join(os.homedir(), 'sshm_config'), 'ssh_remote_default.json');
 }
 
 function credsFrom(
@@ -44,10 +43,18 @@ export class Inventory {
     const file = resolveInventoryPath(explicitPath);
     const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      throw new Error(`Inventory must be a JSON array: ${file}`);
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object'
+      || !Number.isSafeInteger(parsed.group_number) || parsed.group_number < 0
+      || !Array.isArray(parsed.nodes)
+      || !parsed.nodes.every((node: unknown) => node !== null && typeof node === 'object' && !Array.isArray(node))) {
+      throw new Error(`Inventory must be {group_number: integer, nodes: array}: ${file}; convert legacy arrays with convert_legacy_config.sh`);
     }
-    return new Inventory(parsed as InventoryNode[]);
+    const base = path.basename(file);
+    if ((base === 'ssh_remote_default.json' && parsed.group_number !== 0)
+      || (/^ssh_remote_.+\.json$/.test(base) && base !== 'ssh_remote_default.json' && parsed.group_number === 0)) {
+      throw new Error(`Group 0 is reserved for ssh_remote_default.json: ${file}`);
+    }
+    return new Inventory(parsed.nodes as InventoryNode[]);
   }
 
   raw(): InventoryNode[] {

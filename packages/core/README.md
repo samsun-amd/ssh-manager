@@ -12,7 +12,7 @@ Consumed by:
 The `sshm` bash script in the repo root is a **standalone** tool. These consumers
 import this library directly; they do not execute that script for remote file
 operations. Common selector behavior follows sshm, but SMC inventory layout and
-configuration overrides currently differ (see "Relationship to sshm" below).
+group discovery and configuration overrides differ (see "Relationship to sshm" below).
 
 ---
 
@@ -22,7 +22,7 @@ Everything lives under `~/github/ssh-manager/packages/core/src/`. The four
 layers compose top-to-bottom; each one only depends on the layers above it.
 
 ```
-inventory  ssh_remote.json  ->  Endpoint        (pure data, no network)
+inventory  group config    ->  Endpoint        (pure data, no network)
    |
 connection Endpoint         ->  SshSession      (ssh2 Client, optional 1 jump hop, OS + SFTP probe)
    |        SshPool          ->  pooled, health-checked, idle-evicted sessions
@@ -33,11 +33,19 @@ transfer   SshSession(s)     ->  TransferEngine  (hub<->remote + remote<->remote
 ```
 
 ### `inventory/` — selector resolution (no network)
-`Inventory.load(path?)` reads `ssh_remote.json` (a JSON **array** of nodes) and
+`Inventory.load(path?)` reads `{ group_number, nodes }` from a config file and
 `resolve(selector, sub?)` flattens the various node shapes into one
 **`Endpoint`**. Pure logic — nothing here opens a socket. Also exports
-`resolveInventoryPath()` (precedence: explicit path -> `$SSH_REMOTE_JSON` -> `~/note/ssh_remote.json`)
+`resolveInventoryPath()` (precedence: explicit path -> `$SSH_REMOTE_JSON` -> `${SSHM_CONFIG_DIR:-$HOME/sshm_config}/ssh_remote_default.json`)
 and `adhocEndpoint()` for targets not in the inventory.
+
+Files must use the group object format; legacy arrays fail with conversion
+instructions. `group_number` must be a nonnegative safe integer, and `nodes`
+must be an array of objects. Group 0 is reserved for `ssh_remote_default.json`
+when using managed filenames. Run `convert_legacy_config.sh` to migrate a file.
+The public `new Inventory(nodes)` constructor and `raw()` still use node arrays,
+so webscp's inline app configuration remains unchanged. Group discovery and
+collision warnings belong to the CLI; `Inventory.load(path)` selects one file.
 
 ### `connection/` — live sessions + pool
 - `SshSession` wraps an ssh2 `Client`. If the `Endpoint` has a `jump`, it opens
@@ -191,8 +199,8 @@ ln -s ~/github/ssh-manager/packages/core \
 ```ts
 import { Inventory, SshPool, RemoteFs, TransferEngine, adhocEndpoint } from '@ssh-manager/core';
 
-// 1. inventory: ssh_remote.json -> Endpoint
-const inv = Inventory.load();                 // $SSH_REMOTE_JSON or ~/note/ssh_remote.json
+// 1. inventory: group config -> Endpoint
+const inv = Inventory.load();                 // $SSH_REMOTE_JSON or ~/sshm_config/ssh_remote_default.json
 const ep  = inv.resolve('server1', 'host2');  // host connects directly
 const ad  = adhocEndpoint({ host, port, user, password });
 
@@ -224,15 +232,20 @@ The CLI and core have separate runtimes and these current differences:
 
 | Behavior | Bash CLI | TypeScript core |
 |---|---|---|
-| Inventory path | `SSHM_CONFIG` -> readable `~/note/ssh_remote.json` -> script-local `ssh_remote.json` | explicit path -> `SSH_REMOTE_JSON` -> `~/note/ssh_remote.json` |
-| SMC configuration | one top-level `type: "smc"` entry, shared across server selections | an embedded `smc` block on each server |
+| Inventory path | explicit `-g` -> `SSHM_CONFIG` -> default config | explicit path -> `SSH_REMOTE_JSON` -> default config |
+| Default directory | `SSHM_CONFIG_DIR` or `~/sshm_config` | `SSHM_CONFIG_DIR` or `~/sshm_config` |
+| File envelope | `{ group_number, nodes }` | `{ group_number, nodes }` |
+| SMC configuration | one standalone `type: "smc"` node, shared across server selections | an embedded `smc` block on each server |
 | Host connection | direct | direct |
 | SMC sub-target connection | via the selected server's BMC | via the owning server's BMC |
 | Directory transfer | tar stream with optional gzip, SCP fallback | per-file SFTP or exec streams |
 
 `md-reader` creates ad-hoc endpoints from its own remote-root settings and does
 not load this inventory. `webscp` uses core inventory resolution or ad-hoc
-endpoints. Keep these consumer interfaces stable when changing the CLI.
+endpoints. Its inline config is unaffected, but external legacy inventory files
+must be converted before switching core versions. Existing array-only external
+file fixtures must likewise be wrapped. Keep these consumer interfaces stable
+when changing the CLI.
 
 `~/github/ssh-manager/shared/` contains reference data, with limited test integration:
 
