@@ -5,15 +5,36 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSHM="$SCRIPT_DIR/sshm"
-TEST_REPORT="$SCRIPT_DIR/sshm_test_report.md"
+TEST_REPORT="${SSHM_TEST_REPORT:-$SCRIPT_DIR/sshm_test_report.md}"
+QA_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sshm_qa.XXXXXX") || exit 1
+REMOTE_TEST_DIR=""
 
 if [[ -n "${SSHM_CONFIG:-}" ]]; then
     CONFIG_FILE="$SSHM_CONFIG"
+elif [[ "${RUN_SSHM_LIVE_TESTS:-0}" != 1 ]]; then
+    CONFIG_FILE="$SCRIPT_DIR/shared/cli-test-inventory.json"
 elif [[ -r "$HOME/note/ssh_remote.json" ]]; then
     CONFIG_FILE="$HOME/note/ssh_remote.json"
 else
     CONFIG_FILE="$SCRIPT_DIR/ssh_remote.json"
 fi
+
+cleanup_live_dir() {
+    [[ -z "$REMOTE_TEST_DIR" ]] && return 0
+    timeout 15 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" \
+        -c "rm -rf -- '$REMOTE_TEST_DIR'" "$CLIENT_NAME" || return $?
+    REMOTE_TEST_DIR=""
+}
+trap 'cleanup_live_dir >/dev/null 2>&1; rm -rf "$QA_TMP_DIR"' EXIT
+
+setup_live_dir() {
+    local output candidate
+    output=$(timeout 15 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" \
+        -c 'mktemp -d /tmp/sshm_qa.XXXXXX' "$CLIENT_NAME") || return $?
+    candidate=${output##*$'\n'}
+    [[ "$candidate" =~ ^/tmp/sshm_qa\.[a-zA-Z0-9]+$ ]] || return 1
+    printf '%s\n' "$candidate"
+}
 
 GREEN='\033[1;32m'
 RED='\033[1;31m'
@@ -111,6 +132,7 @@ run_test() {
     command_display=$(command_to_string "$@" | sanitize_text)
     output=$("$@" 2>&1)
     exit_code=$?
+    LAST_TEST_OUTPUT="$output"
     sanitized_output=$(printf "%s" "$output" | sanitize_text)
 
     test_passed=false
@@ -127,7 +149,9 @@ run_test() {
             ;;
         contains:*)
             expected_text="${expected_result#contains:}"
-            grep -Fq "$expected_text" <<< "$output" && test_passed=true
+            if [[ $exit_code -eq 0 ]] && grep -Fq "$expected_text" <<< "$output"; then
+                test_passed=true
+            fi
             ;;
         error_contains:*)
             expected_text="${expected_result#error_contains:}"
@@ -137,16 +161,23 @@ run_test() {
             ;;
     esac
 
+    # A timeout or missing executable must never satisfy an expected failure.
+    if [[ $exit_code -eq 124 || $exit_code -eq 127 || $exit_code -eq 137 ]]; then
+        test_passed=false
+    fi
+
     if [[ "$test_passed" == "true" ]]; then
         PASSED_TESTS=$((PASSED_TESTS + 1))
         increment_category_passed "$category"
         record_test "$test_name" "$command_display" "PASS" "$sanitized_output" "$category"
         echo -e "${GREEN}PASS${NC}\n"
+        return 0
     else
         FAILED_TESTS=$((FAILED_TESTS + 1))
         record_test "$test_name" "$command_display" "FAIL" "$sanitized_output" "$category"
         echo -e "${RED}FAIL${NC}"
         echo -e "Expected: $expected_result, exit code: $exit_code\n"
+        return 1
     fi
 }
 
@@ -265,6 +296,10 @@ for cmd in jq ssh scp sshpass; do
 done
 echo ""
 
+echo -e "${YELLOW}=== OFFLINE TRANSPORT REGRESSION ===${NC}\n"
+run_test "Transport arguments, exit codes, and tar/gzip integrity" success scp \
+    timeout 90 bash "$SCRIPT_DIR/sshm_exit_test.sh"
+
 echo -e "${YELLOW}=== BASIC FUNCTION TESTS ===${NC}\n"
 run_test "Help Display" success basic timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -h
 run_test "List All Nodes" success basic timeout 5 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -l
@@ -311,24 +346,35 @@ if [[ "${RUN_SSHM_LIVE_TESTS:-0}" == "1" ]]; then
         run_test "Exit Code Propagation" exit_code:42 edge timeout 15 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -c "exit 42" "$CLIENT_NAME"
         run_test "Ping Check with Command" contains:ONLINE network timeout 15 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -p -c "echo success" "$CLIENT_NAME"
 
-        TEST_FILE="/tmp/sshm_test_upload_$(date +%s).txt"
-        DOWNLOAD_FILE="/tmp/sshm_download_$(date +%s).txt"
-        printf "Test content %s\n" "$(date)" > "$TEST_FILE"
-        run_test "SCP Upload Single File" success scp timeout 20 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "$TEST_FILE" remote:/tmp/ "$CLIENT_NAME"
-        run_test "SCP Download Single File" success scp timeout 20 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "remote:/tmp/$(basename "$TEST_FILE")" "$DOWNLOAD_FILE" "$CLIENT_NAME"
-        rm -f "$TEST_FILE" "$DOWNLOAD_FILE"
+        if run_test "Create Remote Test Directory" success scp setup_live_dir; then
+            REMOTE_TEST_DIR=${LAST_TEST_OUTPUT##*$'\n'}
+            TEST_FILE="$QA_TMP_DIR/binary file"
+            DOWNLOAD_FILE="$QA_TMP_DIR/downloaded file"
+            printf 'Test content\000\377\n' > "$TEST_FILE"
+            run_test "SCP Upload Single File" success scp timeout 20 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "$TEST_FILE" "remote:$REMOTE_TEST_DIR/" "$CLIENT_NAME"
+            run_test "SCP Download Single File" success scp timeout 20 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "remote:$REMOTE_TEST_DIR/${TEST_FILE##*/}" "$DOWNLOAD_FILE" "$CLIENT_NAME"
+            run_test "SCP File Content Match" success scp cmp "$TEST_FILE" "$DOWNLOAD_FILE"
 
-        # Directory transfers use the tar-stream fast path.
-        UPLOAD_DIR="/tmp/sshm_dir_up_$(date +%s)"
-        REMOTE_DIR_BASE="/tmp/sshm_dir_remote_$(date +%s)"
-        DOWNLOAD_DIR="/tmp/sshm_dir_down_$(date +%s)"
-        mkdir -p "$UPLOAD_DIR"
-        for n in 1 2 3 4 5; do printf "small file %s\n" "$n" > "$UPLOAD_DIR/f_$n.txt"; done
-        run_test "SCP Upload Directory (tar stream)" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "$UPLOAD_DIR/" "remote:$REMOTE_DIR_BASE/" "$CLIENT_NAME"
-        mkdir -p "$DOWNLOAD_DIR"
-        run_test "SCP Download Directory (tar stream)" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "remote:$REMOTE_DIR_BASE/$(basename "$UPLOAD_DIR")" "$DOWNLOAD_DIR/" "$CLIENT_NAME"
-        run_test "SCP Directory Progress Off" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" SSHM_PROGRESS=off "$SSHM" -s "$UPLOAD_DIR/" "remote:$REMOTE_DIR_BASE/" "$CLIENT_NAME"
-        rm -rf "$UPLOAD_DIR" "$DOWNLOAD_DIR"
+            UPLOAD_DIR="$QA_TMP_DIR/tree with space"
+            DOWNLOAD_DIR="$QA_TMP_DIR/download"
+            mkdir -p "$UPLOAD_DIR/sub/empty" "$DOWNLOAD_DIR"
+            cp "$TEST_FILE" "$UPLOAD_DIR/sub/binary file"
+            printf 'hidden\n' > "$UPLOAD_DIR/.hidden"
+            touch "$UPLOAD_DIR/empty file"
+            run_test "SCP Upload Directory (tar stream)" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "$UPLOAD_DIR/" "remote:$REMOTE_TEST_DIR/" "$CLIENT_NAME"
+            run_test "SCP Download Directory (tar stream)" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" "$SSHM" -s "remote:$REMOTE_TEST_DIR/${UPLOAD_DIR##*/}" "$DOWNLOAD_DIR/" "$CLIENT_NAME"
+            run_test "SCP Directory Content Match" success scp diff -r "$UPLOAD_DIR" "$DOWNLOAD_DIR/${UPLOAD_DIR##*/}"
+            run_test "SCP Directory Progress Off" success scp timeout 30 env "SSHM_CONFIG=$CONFIG_FILE" SSHM_PROGRESS=off "$SSHM" -s "$UPLOAD_DIR/" "remote:$REMOTE_TEST_DIR/" "$CLIENT_NAME"
+            if run_test "Remove Remote Test Directory" success scp cleanup_live_dir; then
+                REMOTE_TEST_DIR=""
+            fi
+        else
+            for test_name in "SCP Upload Single File" "SCP Download Single File" "SCP File Content Match" \
+                "SCP Upload Directory (tar stream)" "SCP Download Directory (tar stream)" \
+                "SCP Directory Content Match" "SCP Directory Progress Off" "Remove Remote Test Directory"; do
+                skip_test "$test_name" "Remote test directory setup failed" scp
+            done
+        fi
     else
         skip_test "Remote Command on Client Name" "No client node in config" command
         skip_test "Exit Code Propagation" "No client node in config" edge
@@ -338,6 +384,9 @@ if [[ "${RUN_SSHM_LIVE_TESTS:-0}" == "1" ]]; then
         skip_test "SCP Upload Directory (tar stream)" "No client node in config" scp
         skip_test "SCP Download Directory (tar stream)" "No client node in config" scp
         skip_test "SCP Directory Progress Off" "No client node in config" scp
+        for test_name in "Create Remote Test Directory" "SCP File Content Match" "SCP Directory Content Match" "Remove Remote Test Directory"; do
+            skip_test "$test_name" "No client node in config" scp
+        done
     fi
 
     if [[ -n "$CLIENT_INDEX" ]]; then
@@ -376,6 +425,9 @@ else
     skip_test "SCP Download Directory (tar stream)" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" scp
     skip_test "SCP Directory Progress Off" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" scp
     skip_test "Exit Code Propagation" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" edge
+    for test_name in "Create Remote Test Directory" "SCP File Content Match" "SCP Directory Content Match" "Remove Remote Test Directory"; do
+        skip_test "$test_name" "Set RUN_SSHM_LIVE_TESTS=1 to enable live SSH tests" scp
+    done
 fi
 
 echo -e "\n${BLUE}Generating test report...${NC}"

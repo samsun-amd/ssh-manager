@@ -306,6 +306,7 @@ run_selected_action() {
     else
         do_ssh "$user" "$password" "$ip" "$target_port" "$@"
     fi
+    exit $?
 }
 
 print_usage() {

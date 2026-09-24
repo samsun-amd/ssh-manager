@@ -1,0 +1,6 @@
+[
+  {"type":"client","name":"client","ip":"192.0.2.1","user":"test","port":2201,"pass":"client secret"},
+  {"type":"server","name":"server","bmc":{"ip":"192.0.2.2","user":"gateway","port":2202,"pass":"jump secret"},
+   "hosts":[{"ip":"192.0.2.3","user":"host","port":2203}]},
+  {"type":"smc","name":"smc","ip":"192.0.2.4","user":"root","port":2204,"pass":"smc secret"}
+]

@@ -9,10 +9,10 @@ Consumed by:
 - `~/github/md-reader` — remote markdown read/write
 - `~/github/webscp` — two-pane cross-machine SCP/SFTP web UI
 
-The `sshm` bash script in the repo root is a **standalone** tool and is never
-changed by this package. This library is a faithful **mirror** of sshm's
-inventory/selector semantics in TypeScript, kept aligned via a shared fixture
-(see "Relationship to sshm" below).
+The `sshm` bash script in the repo root is a **standalone** tool. These consumers
+import this library directly; they do not execute that script for remote file
+operations. Common selector behavior follows sshm, but SMC inventory layout and
+configuration overrides currently differ (see "Relationship to sshm" below).
 
 ---
 
@@ -36,7 +36,7 @@ transfer   SshSession(s)     ->  TransferEngine  (hub<->remote + remote<->remote
 `Inventory.load(path?)` reads `ssh_remote.json` (a JSON **array** of nodes) and
 `resolve(selector, sub?)` flattens the various node shapes into one
 **`Endpoint`**. Pure logic — nothing here opens a socket. Also exports
-`resolveInventoryPath()` (precedence: `$SSH_REMOTE_JSON` -> `~/note/ssh_remote.json`)
+`resolveInventoryPath()` (precedence: explicit path -> `$SSH_REMOTE_JSON` -> `~/note/ssh_remote.json`)
 and `adhocEndpoint()` for targets not in the inventory.
 
 ### `connection/` — live sessions + pool
@@ -55,7 +55,7 @@ and `adhocEndpoint()` for targets not in the inventory.
   transfer layers for binary-safe `cat` streaming on no-SFTP endpoints.
 - `SshPool` keeps sessions keyed by `user@host:port` (jump prefixed). Features:
   handshake `readyTimeout`, idle eviction, liveness check on reuse, a
-  `maxPerKey` cap, auto-eviction when the transport dies, and `withSession()`
+  `maxPerKey` idle-session retention cap, auto-eviction when the transport dies, and `withSession()`
   (acquire / run / always release).
 
 ### `fs/` — SFTP + OS-aware paths (with exec fallback)
@@ -115,21 +115,22 @@ interface Endpoint {
 }
 ```
 
-### Selector -> Endpoint mapping (mirrors sshm)
+### Selector -> Endpoint mapping
 
 | call | result |
 |---|---|
 | `resolve('client')` | client node, direct |
 | `resolve('server1')` | server's **BMC**, direct (bare server name = BMC) |
 | `resolve('3')` | 3rd inventory node (1-based), default connection |
-| `resolve('10.0.0.11')` | IP search across client / smc / bmc / hosts |
+| `resolve('10.0.0.11')` | IP search across clients and server bmc / smc / hosts |
 | `resolve('server1', 'bmc')` | the BMC directly |
-| `resolve('server1', 'host2')` | host #2 (1-based) **via the BMC jump** |
-| `resolve('server1', 'smc')` | the singleton SMC node **via this server's BMC jump** |
+| `resolve('server1', 'host2')` | host #2 (1-based), direct |
+| `resolve('server1', 'smc')` | embedded `server1.smc` **via this server's BMC jump** |
 
-An IP that matches a host-behind-a-BMC resolves with `jump` set to that server's
-BMC; an IP that matches a BMC/client/smc resolves direct (no jump). Missing
-fields throw a descriptive `Error`; ports default to `22`.
+Host, BMC, and client IP matches connect directly. An embedded SMC IP match uses
+the owning server's BMC as the jump when configured. Ports default to `22`.
+Core supports `client` and `server` nodes; it does not resolve the CLI's
+standalone `type: "smc"` nodes. To select an SMC, its server must declare an `smc` block.
 
 ---
 
@@ -171,7 +172,7 @@ Workflow after changing core:
 
 ```bash
 cd ~/github/ssh-manager/packages/core && npm run build   # refresh dist/
-# consumers import @ssh-manager/core and pick up the new dist/ immediately
+# new Node processes load the refreshed dist/; restart running consumers to reload it
 ```
 
 If a consumer's symlink is missing, recreate it (adjust for relative vs absolute
@@ -190,9 +191,9 @@ ln -s ~/github/ssh-manager/packages/core \
 ```ts
 import { Inventory, SshPool, RemoteFs, TransferEngine, adhocEndpoint } from '@ssh-manager/core';
 
-// 1. inventory: ssh_remote.json -> Endpoint (mirrors sshm selectors)
+// 1. inventory: ssh_remote.json -> Endpoint
 const inv = Inventory.load();                 // $SSH_REMOTE_JSON or ~/note/ssh_remote.json
-const ep  = inv.resolve('server1', 'host2');  // host via BMC jump
+const ep  = inv.resolve('server1', 'host2');  // host connects directly
 const ad  = adhocEndpoint({ host, port, user, password });
 
 // 2. connection: pooled ssh2 sessions w/ readyTimeout + idle evict + health check
@@ -217,18 +218,32 @@ await engine.hubToRemote('/local/file', session, '~/file', {
 
 ---
 
-## Relationship to sshm (mirror, kept aligned)
+## Relationship to sshm
 
-`~/github/ssh-manager/shared/` holds language-neutral fixtures so the bash tool
-and this library never drift:
+The CLI and core have separate runtimes and these current differences:
+
+| Behavior | Bash CLI | TypeScript core |
+|---|---|---|
+| Inventory path | `SSHM_CONFIG` -> readable `~/note/ssh_remote.json` -> script-local `ssh_remote.json` | explicit path -> `SSH_REMOTE_JSON` -> `~/note/ssh_remote.json` |
+| SMC configuration | one top-level `type: "smc"` entry, shared across server selections | an embedded `smc` block on each server |
+| Host connection | direct | direct |
+| SMC sub-target connection | via the selected server's BMC | via the owning server's BMC |
+| Directory transfer | tar stream with optional gzip, SCP fallback | per-file SFTP or exec streams |
+
+`md-reader` creates ad-hoc endpoints from its own remote-root settings and does
+not load this inventory. `webscp` uses core inventory resolution or ad-hoc
+endpoints. Keep these consumer interfaces stable when changing the CLI.
+
+`~/github/ssh-manager/shared/` contains reference data, with limited test integration:
 
 - `inventory-conformance.json` — `(selector -> expected Endpoint)` cases plus a
   sample inventory. This library's `inventory.test.js` asserts against every
-  case; a matching `sshm` harness can assert the same fixture. Add a case here
-  whenever you add or change selector behavior in **either** implementation.
-- `transfer-policy.json` — the de-hardcoded transfer tuning (tar threshold,
-  already-compressed extension list) that `sshm` previously embedded; sshm reads
-  it with `jq`, core can import it.
+  case, and webscp tests use its inventory. The CLI QA does not consume this
+  fixture, whose embedded SMC shape is specific to core.
+- `transfer-policy.json` — reference values for the CLI's tar threshold and
+  already-compressed extensions. Neither runtime currently reads this file;
+  the CLI keeps its defaults in `sshm`, with environment overrides.
 
-Rule of thumb: **never change selector semantics in only one place.** Update the
-fixture and both implementations together.
+When changing common selector behavior, check both implementations and their
+tests. SMC schema unification is a separate compatibility change, not implied
+by editing these reference files.

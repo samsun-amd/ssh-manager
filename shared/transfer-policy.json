@@ -1,5 +1,5 @@
 {
-  "_comment": "De-hardcoded transfer tuning shared by sshm and @ssh-manager/core. sshm can read these with jq; core imports them. Mirrors the env-overridable knobs originally hardcoded in sshm.",
+  "_comment": "Reference values for sshm directory transfer tuning. Neither sshm nor @ssh-manager/core reads this file at runtime; CLI defaults and environment overrides live in sshm.",
   "tarThresholdBytes": 10485760,
   "compressedRatioPercent": 70,
   "alreadyCompressedExt": [

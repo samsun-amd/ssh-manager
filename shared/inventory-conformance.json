@@ -1,5 +1,5 @@
 {
-  "_comment": "Selector->Endpoint expectations shared by sshm (bash) and @ssh-manager/core. Uses the committed example ssh_remote.json shape with placeholder IPs. Keeps both implementations aligned without sharing code.",
+  "_comment": "Selector->Endpoint expectations tested by @ssh-manager/core; webscp tests also use this sample inventory. CLI QA does not consume this fixture. Embedded server.smc differs from the CLI's top-level SMC node.",
   "inventory": [
     {
       "type": "server",

@@ -36,6 +36,10 @@ SSHM_CONFIG=/path/to/ssh_remote.json ./sshm -l
 SSHM_CONFIG=/path/to/ssh_remote.json ./sshm -c "hostname" server1
 ```
 
+The separate [`@ssh-manager/core` library](packages/core/README.md) uses an
+explicit path, then `SSH_REMOTE_JSON`, then `~/note/ssh_remote.json`.
+`SSHM_CONFIG` applies only to the Bash CLI; `SSH_REMOTE_JSON` applies only to core.
+
 ## JSON Inventory Schema
 
 The inventory supports these node types:
@@ -43,6 +47,11 @@ The inventory supports these node types:
 - `server`: a platform with one BMC and optional host NICs.
 - `client`: a standalone SSH target.
 - `smc`: an SMC target that can be accessed through a server BMC jump host.
+
+The CLI uses one top-level SMC entry for `server1 smc`, `server2 smc`, etc.,
+with each server's BMC as the jump host. This supports a fixed SMC IP shared
+across separate BMC networks. Core uses an embedded `server.smc` block instead;
+the two SMC inventory formats are currently different.
 
 ```json
 [
@@ -148,7 +157,7 @@ sshm -s ./local_dir/ remote:/tmp/ server1
 sshm -s remote:/var/logs/ ./backup/ server1
 ```
 
-SCP through a server host or SMC path:
+SCP directly to a server host, or to an SMC through the BMC:
 
 ```bash
 sshm -s data.txt remote:/tmp/ server1 host1
@@ -162,7 +171,7 @@ When the source of a `-s` transfer is a directory, `sshm` streams it with
 `tar | ssh tar -x` instead of `scp -r`. A single SSH connection carries the
 whole tree, which is dramatically faster than `scp -r` for directories with many
 small files over slow links (for example BMC/SMC). This works for both upload and
-download, and remains compatible with the `host<N>` and `smc` jump-host paths.
+download. `host<N>` connects directly; only the `smc` sub-target uses a BMC jump.
 
 Compression is decided automatically:
 
@@ -196,6 +205,48 @@ Typical failures include:
 - Missing or unreadable config files.
 
 Remote command exit codes are preserved. For example, `sshm -c "exit 42" client1` exits with code `42`.
+
+File-transfer failures also return nonzero exit codes, including SCP failures,
+remote path probe failures, and directory stream failures. This applies to
+name, number, IP, and server sub-target selectors, so shell callers can detect
+failed transfers with `if`, `&&`, or `$?`.
+
+## Backend compatibility and tests
+
+`md-reader` and `webscp` import `@ssh-manager/core` directly; their remote file
+operations do not execute the Bash `sshm` script. CLI exit-code changes therefore
+do not change their HTTP/WebSocket responses or core API behavior.
+
+Run the CLI QA suite, including the offline transport regression, with one command:
+
+```bash
+bash sshm_qa_test.sh
+```
+
+By default, QA uses `shared/cli-test-inventory.json` (reserved example IPs and
+fake credentials), and opens no remote connections. The transport regression
+checks exact SSH/SCP arguments, target and jump ports, password handling, command
+quoting, and exit codes. It runs real local tar/gzip streams through a mock SSH
+transport, compares uploaded/downloaded trees (including binary files, dotfiles,
+empty entries, and quoted paths), and injects failures at both pipeline ends.
+SCP fallback is checked with a local copy stand-in. These checks require Bash,
+jq, GNU tar/gzip, coreutils, and diff; they do not verify an actual SSH server.
+Use `bash sshm_exit_test.sh` to run just this regression group.
+
+The report is written to `sshm_test_report.md`; `SSHM_TEST_REPORT` overrides its
+path. The transport regression is one report row containing its own check count.
+Any failed check, timeout, or missing executable makes QA return nonzero.
+
+Live SSH/SCP tests are opt-in and use `SSHM_CONFIG` or the normal private
+inventory. They connect to selected inventory nodes and transfer test data to
+a new remote `/tmp/sshm_qa.*` directory. File and directory round trips are
+compared with `cmp`/`diff`; test directories are cleaned up afterward:
+
+```bash
+RUN_SSHM_LIVE_TESTS=1 SSHM_CONFIG=/path/to/test-inventory.json bash sshm_qa_test.sh
+```
+
+Core and consumer tests remain separate; see the core README for build commands.
 
 ## Installation
 
