@@ -97,6 +97,90 @@ to a new-format file does not make old array-only readers compatible. Update any
 explicit `SSHM_CONFIG`, `SSH_REMOTE_JSON`, or webscp `inventoryPath` settings to
 the converted file when switching those callers.
 
+### Offline config editor
+
+Open [`config-editor/sshm_config_editor.html`](config-editor/sshm_config_editor.html)
+in a current **Windows Chrome or Edge** browser. Download the HTML file itself,
+then open the saved file. It runs directly from `file://`, without installation,
+a server, or an Internet connection. All CSS, JavaScript, and the MIT-licensed
+fflate ZIP library are embedded. The interface uses Traditional Chinese.
+
+1. Start with the empty default group, or import existing configs. **匯入檔案**
+   selects JSON or archive files; **匯入資料夾** selects a directory. These buttons
+   use separate native picker modes. Drag and drop accepts both directly.
+   Folders and archives are searched recursively for `ssh_remote_*.json`;
+   unrelated files are ignored. Folder drops use the browser's File System
+   Access API and work directly from `file://` in current Chrome/Edge.
+2. Select groups in the **Groups** sidebar. Its separate **Group 操作** section
+   contains create, settings, copy, and delete buttons for managing groups and
+   their numbers. Add `client`, `server`, or `smc` nodes, edit credentials and
+   hosts, search nodes, and reorder them. Group, selected-node, and embedded SMC
+   deletion buttons use red text and ask for confirmation.
+   Reordering changes CLI node numbers or `host<N>` numbers.
+3. Select nodes, click **分配／拆分…**, and select one or more destination groups.
+   **Move** copies to every selected destination and removes the source nodes;
+   **Copy** keeps the source. Each copy can be edited independently. When moving
+   servers, the source's standalone SMC can also be copied to groups that lack
+   one. Existing destination SMC settings are retained.
+4. Switch to **Raw JSON** to inspect the current group's exact output. The
+   preview is read-only and reflects form edits, including actual passwords.
+   Lists use 100 rows per page; Raw JSON is generated only while its tab is open.
+5. Click **輸出資料夾…** and choose the **parent folder** in the browser's native
+   picker. Review the destination and filenames, then confirm writing. The editor
+   creates an `sshm_config` child folder containing one JSON file per group:
+
+   ```text
+   <selected folder>/
+   └── sshm_config/
+       ├── ssh_remote_default.json
+       ├── ssh_remote_tw.json
+       └── ssh_remote_us.json
+   ```
+
+   To update an existing `sshm_config` folder, select its parent. The child folder
+   is created only after confirming the write; cancelling the preview creates
+   no folder or files.
+
+A legacy array must be imported as **one standalone JSON file**. Import converts
+it directly to default (group 0), preserving all nodes and their order. To split
+it afterward, create destination groups and move/copy selected nodes. Unassigned
+nodes remain in default. Modern files use the same envelope as the CLI and core.
+Unknown group/node/credential fields, optional values, and array order survive
+import and export. Embedded `server.smc` fields are preserved and editable;
+use **刪除** beside **Embedded SMC · core** to remove the entire optional block
+from the node, Raw JSON, and exported file after confirmation.
+The editor does not change the CLI/core SMC distinction described below.
+
+Supported archives are ZIP (stored or deflated entries), TAR (including common
+PAX/GNU long-name headers), TAR.GZ, and TGZ. Limits per import are 256 configs,
+32 MiB of input and extracted data, and 2,048 entries per archive. Encrypted,
+split, and ZIP64 archives are unsupported. Unsafe archive paths and links are
+rejected; ZIP config contents, TAR headers, and GZIP streams are checked for
+corruption. Archive imports require modern group files; import legacy JSON
+separately before splitting it.
+
+Validation blocks export for invalid group names/numbers, filename collisions
+(case-insensitive on Windows), unsupported node types, missing required fields,
+or invalid ports. Duplicate group numbers produce warnings without blocking
+export, matching CLI selection by group name. Importing over an existing group
+requires confirmation, except for an empty, newly created group. Structurally
+valid configs with field errors can be imported and corrected in the editor.
+
+The browser requires folder permission; typing a Windows path cannot grant it.
+The page displays `<selected folder name>/sshm_config/` because the browser does
+not expose the full path. Existing JSON files inside that child folder require
+explicit overwrite confirmation. Other files, including obsolete group files,
+are retained and listed for review; use a fresh parent folder when exporting a
+replacement configuration set. A file named `sshm_config` prevents export until
+the conflict is resolved. Files are written individually. If writing fails
+midway, the editor reports how many completed and keeps the unsaved state;
+the folder is not updated atomically.
+
+Edits stay in page memory and are lost on reload/close without export; there is
+no browser storage or network upload. Keep the exported files private. Copy them
+to the machine's `~/sshm_config` (or its configured directory) to use them with
+`sshm`. The editor does not install configs on a remote machine or probe servers.
+
 ## JSON Inventory Schema
 
 The `nodes` array supports these node types:
@@ -308,6 +392,33 @@ after failures through mock transports. No local SSH server or test account is
 needed. The installer does not run live checks.
 Any failed check, timeout, or missing executable makes QA return nonzero.
 
+### Editor regression tests
+
+Run the standalone editor checks after changing the HTML:
+
+```bash
+node config-editor/test.cjs
+# If Chrome is not already in the local Puppeteer cache:
+CHROME_BIN=/path/to/chrome node config-editor/test.cjs
+```
+
+The test harness requires Node.js 22+, Python 3, headless Chrome, Bash, and jq.
+It needs no npm install and uses synthetic inventories. Tests cover archive
+formats and corruption, legacy conversion, move/copy and field preservation,
+validation, form/Raw JSON synchronization, drag/drop, `sshm_config` child-folder
+creation, overwrite confirmation, cancelled/failed output, and exported files
+loaded by the actual CLI. Browser checks include real nested-folder drag/drop
+from `file://` (including Unicode, spaces, `#`, and `%` in the folder path),
+desktop/narrow layouts, injected visual
+defects, and a 5,000-node inventory. They run without relaxed local-file security
+flags. Set `EDITOR_SCREENSHOT` to save a synthetic browser screenshot.
+
+Editor v1.6 passed 56 automated checks and manual user acceptance on 2026-09-24.
+Output directory handles are mocked in automation to test file contents and
+failure handling; the native Windows folder picker remains part of manual
+Chrome/Edge validation. Editor tests are separate from `sshm_qa_test.sh`, so
+normal CLI Local QA and installation do not gain a browser or Node.js dependency.
+
 ### Live inventory QA
 
 Use the CLI itself to check the machines in the current private configs:
@@ -388,6 +499,11 @@ tw/us templates are never activated automatically:
 ```bash
 ./install.sh
 ```
+
+This installer updates the Bash CLI and handles its private config setup.
+`@ssh-manager/core` is built and reloaded separately as part of updating its
+consumers (`md-reader` and `webscp`); `install.sh` does not rebuild core or
+restart those services. See the [core build instructions](packages/core/README.md#build--test).
 
 The installer honors a couple of overrides:
 
