@@ -280,6 +280,20 @@ sshm client1
 sshm -P 2222 client1
 ```
 
+Interactive connections set the terminal tab/window title to the selected JSON
+node's `name` once, immediately before starting SSH. Name, number, and IP selectors
+use the same inventory name; `server1 bmc`, `server1 host1`, and `server1 smc` all
+use the server node's name. Control characters are removed from the title.
+The title uses the standard OSC escape sequence, so subsequent remote shell or
+tmux title updates can replace it, including updates from the first remote prompt.
+No title is emitted for `-c`, SCP, redirected input/output, or `TERM=dumb`.
+
+For PowerShell tabs in Windows Terminal, the profile must allow application title
+changes (`suppressApplicationTitle: false`, the default). Clear any manually
+renamed tab title if it hides application titles. `sshm` does not change terminal
+settings or restore the previous title on disconnect; the local shell may set
+its own title when its prompt returns.
+
 Remote command execution:
 
 ```bash
@@ -377,8 +391,10 @@ checks exact SSH/SCP arguments, target and jump ports, password handling, comman
 quoting, and exit codes. It runs real local tar/gzip streams through a mock SSH
 transport, compares uploaded/downloaded trees (including binary files, dotfiles,
 empty entries, and quoted paths), and injects failures at both pipeline ends.
-SCP fallback is checked with a local copy stand-in. These checks require Bash,
-jq, GNU tar/gzip, coreutils, and diff; they do not verify an actual SSH server.
+SCP fallback is checked with a local copy stand-in. PTY checks verify initial
+titles and subsequent remote title updates. These checks require Bash, jq,
+GNU tar/gzip, coreutils, diff, and util-linux `script`; they do not verify an
+actual SSH server or Windows Terminal rendering.
 Use `bash sshm_exit_test.sh` to run just this regression group.
 
 The report is written to `sshm_test_report.md`; `SSHM_TEST_REPORT` overrides its
