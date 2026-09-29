@@ -35,7 +35,6 @@ case "$tool" in
         if [[ "$MOCK_MODE" == status ]]; then
             if [[ "$tool" == scp ]]; then exit "$MOCK_SCP_EXIT"; fi
             printf '0 0 0 0\n'
-            printf '%s' "${MOCK_REMOTE_OUTPUT:-}"
             exit "$MOCK_SSH_EXIT"
         fi
         while [[ $# -gt 0 ]]; do
@@ -153,61 +152,6 @@ export MOCK_SSH_EXIT=255
 check_exit 255 -s remote:/tmp/file "$TEST_DIR/download" client
 check_no_call scp
 check_exit 255 client
-
-# Exercise actual terminal detection through a PTY; all SSH is still mocked.
-check_pty() {
-    local command actual=0
-    printf -v command '%q ' bash "$SCRIPT_DIR/sshm" "$@"
-    timeout 10 env SHELL=/bin/bash TERM="${TEST_TERM:-xterm-256color}" \
-        script -q -e -c "$command" /dev/null </dev/null > "$TEST_DIR/output" 2>&1 || actual=$?
-    check "PTY exit $MOCK_SSH_EXIT, got $actual: $*" test "$actual" -eq "$MOCK_SSH_EXIT"
-}
-check_titles() {
-    local actual
-    actual=$(LC_ALL=C grep -ao $'\033]0;[^\007]*\007' "$TEST_DIR/output" || true)
-    check 'exact terminal title sequence' test "$actual" = "$1"
-}
-export MOCK_SSH_EXIT=0 MOCK_SCP_EXIT=0 MOCK_REMOTE_OUTPUT=''
-while IFS='|' read -r selector title; do
-    read -r -a target <<< "$selector"
-    check_pty "${target[@]}"
-    check_titles $'\033]0;'"$title"$'\007'
-done <<'CASES'
-client|client
-1|client
-192.0.2.1|client
-server|server
-2 bmc|server
-server host1|server
-192.0.2.2|server
-192.0.2.3|server
-server smc|server
-smc|smc
-3|smc
-192.0.2.4|smc
-CASES
-export MOCK_REMOTE_OUTPUT=$'\033]0;remote tmux\007' MOCK_SSH_EXIT=42
-check_pty client
-check_titles $'\033]0;client\007\n\033]0;remote tmux\007'
-export MOCK_REMOTE_OUTPUT='' MOCK_SSH_EXIT=0
-check_pty -c "$remote_command" client
-check_titles ''
-check_pty -s "$TEST_DIR/file with space" remote:/tmp/ client
-check_titles ''
-TEST_TERM=dumb check_pty client
-check_titles ''
-check_exit 0 client
-check_titles ''
-
-# Group selection and untrusted JSON names must preserve text, not controls.
-mkdir -p "$SSHM_CONFIG_DIR"
-jq '.group_number=1 | .nodes[0].name="Lab %s \\ path 台北\u0000\u0007\u001b\n\r\u007f\u009c"' \
-    "$SSHM_CONFIG" > "$SSHM_CONFIG_DIR/ssh_remote_lab.json"
-check_pty -g lab 1
-check_titles $'\033]0;Lab %s \\ path 台北\007'
-jq 'del(.nodes[0].name)' "$SSHM_CONFIG" > "$TEST_DIR/unnamed.json"
-SSHM_CONFIG="$TEST_DIR/unnamed.json" check_pty 1
-check_titles ''
 
 # Execute the real command string without SSH to test shell quoting and tar bytes.
 export MOCK_MODE=exec MOCK_SSH_EXIT=0

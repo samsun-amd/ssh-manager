@@ -627,13 +627,6 @@ do_ssh() {
             echo -e "${GREEN}Connecting to $target_endpoint ($u)...${NC}"
         fi
 
-        # Set the initial title once; remote shells and tmux may replace it.
-        if [[ -t 0 && -t 1 && "${TERM:-dumb}" != dumb ]]; then
-            local title
-            title=$(jq -r '.name | strings | gsub("[\u0000-\u001f\u007f-\u009f]"; "")' <<< "$node")
-            [[ -z "$title" ]] || printf '\033]0;%s\007' "$title"
-        fi
-
         if [[ -n "$err_file" ]]; then
             ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i" 2> >(tee "$err_file" >&2)
         else
@@ -1070,13 +1063,12 @@ if [[ $# -eq 1 ]]; then
 
     # B. IP Search
     found=$(inventory_jq -r --arg ip "$input" '
-        (.[] | select(.type=="client" and .ip==$ip) | {name:.name, u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
-        (.[] | select(.type=="smc" and .ip==$ip) | {name:.name, u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
-        (.[] | select(.type=="server") | .name as $name | .bmc | select(.ip==$ip) | {name:$name, u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
-        (.[] | select(.type=="server") | .name as $name | .hosts[]? | select(.ip==$ip) | {name:$name, u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)})
+        (.[] | select(.type=="client" and .ip==$ip) | {u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
+        (.[] | select(.type=="smc" and .ip==$ip) | {u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
+        (.[] | select(.type=="server") | .bmc | select(.ip==$ip) | {u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)}) //
+        (.[] | select(.type=="server") | .hosts[]? | select(.ip==$ip) | {u:.user, p:(.pass // ""), i:.ip, port:(.port // 22)})
     ')
     if [[ -n "$found" ]]; then
-        node="$found"
         u=$(echo "$found" | jq -r .u)
         p=$(echo "$found" | jq -r .p)
         i=$(echo "$found" | jq -r .i)
