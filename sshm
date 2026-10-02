@@ -633,6 +633,13 @@ do_ssh() {
             ssh_with_optional_password "$p" "${ssh_opts[@]}" "$u@$i"
         fi
         exit_code=$?
+        if [[ -t 0 && -t 1 ]]; then
+            # A disconnected remote app cannot restore the local terminal modes.
+            printf '\033[?1000;1002;1003;1006l'
+            if [[ "$exit_code" -ne 0 ]]; then
+                printf '\033[?1049l'
+            fi
+        fi
         report_ssh_failure "$exit_code" "$u" "$i" "$port" "$err_file" "interactive session" || true
         cleanup_error_file "$err_file"
         exit "$exit_code"

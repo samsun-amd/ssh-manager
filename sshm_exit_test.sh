@@ -34,6 +34,9 @@ case "$tool" in
     ssh|scp)
         if [[ "$MOCK_MODE" == status ]]; then
             if [[ "$tool" == scp ]]; then exit "$MOCK_SCP_EXIT"; fi
+            if [[ "${MOCK_TERMINAL:-0}" == 1 ]]; then
+                printf '\033[?1049h\033[?1003h\033[?1006h'
+            fi
             printf '0 0 0 0\n'
             exit "$MOCK_SSH_EXIT"
         fi
@@ -152,6 +155,39 @@ export MOCK_SSH_EXIT=255
 check_exit 255 -s remote:/tmp/file "$TEST_DIR/download" client
 check_no_call scp
 check_exit 255 client
+
+# A remote app can leave terminal modes enabled when its SSH connection ends.
+# Run the real CLI inside a PTY; no network or existing terminal is involved.
+check_terminal_return() {
+    local expected=$1 mouse_resets=$2 screen_resets=$3 command actual=0
+    shift 3
+    printf -v command '%q ' bash "$SCRIPT_DIR/sshm" "$@"
+    command+="${terminal_redirect:-}"
+    timeout 10 script -q -e -c "$command" /dev/null < /dev/null > "$TEST_DIR/terminal-output" 2>&1 || actual=$?
+    check "terminal exit $expected: $*" test "$actual" -eq "$expected"
+    check "terminal mouse cleanup: $*" test \
+        "$(grep -Fc $'\033[?1000;1002;1003;1006l' "$TEST_DIR/terminal-output" || true)" -eq "$mouse_resets"
+    check "terminal screen cleanup: $*" test \
+        "$(grep -Fc $'\033[?1049l' "$TEST_DIR/terminal-output" || true)" -eq "$screen_resets"
+}
+
+export MOCK_TERMINAL=1
+for code in 0 42 255; do
+    export MOCK_SSH_EXIT=$code
+    screen_resets=1
+    [[ "$code" == 0 ]] && screen_resets=0
+    check_terminal_return "$code" 1 "$screen_resets" client
+done
+check_terminal_return 255 0 0 -c true client
+export MOCK_SCP_EXIT=255
+check_terminal_return 255 0 0 -s "$TEST_DIR/file with space" remote:/tmp/ client
+terminal_redirect=' < /dev/null'
+check_terminal_return 255 0 0 client
+printf -v terminal_redirect ' > %q' "$TEST_DIR/redirected-output"
+check_terminal_return 255 0 0 client
+check "no cleanup in redirected stdout" test \
+    "$(grep -Fc $'\033[?1000;1002;1003;1006l' "$TEST_DIR/redirected-output" || true)" -eq 0
+unset MOCK_TERMINAL terminal_redirect
 
 # Execute the real command string without SSH to test shell quoting and tar bytes.
 export MOCK_MODE=exec MOCK_SSH_EXIT=0

@@ -354,6 +354,13 @@ Typical failures include:
 
 Remote command exit codes are preserved. For example, `sshm -c "exit 42" client1` exits with code `42`.
 
+When an interactive SSH session returns with both stdin and stdout connected to
+a terminal, `sshm` disables mouse reporting. A nonzero SSH exit also restores the
+normal screen, preventing a disconnected tmux session from leaving the local
+terminal in mouse-reporting or alternate-screen mode. This does not terminate the
+remote tmux session. Command mode (`-c`), transfers, and redirected sessions do not
+receive these cleanup sequences; the original SSH exit code is preserved.
+
 File-transfer failures also return nonzero exit codes, including SCP failures,
 remote path probe failures, and directory stream failures. This applies to
 name, number, IP, and server sub-target selectors, so shell callers can detect
@@ -377,8 +384,10 @@ checks exact SSH/SCP arguments, target and jump ports, password handling, comman
 quoting, and exit codes. It runs real local tar/gzip streams through a mock SSH
 transport, compares uploaded/downloaded trees (including binary files, dotfiles,
 empty entries, and quoted paths), and injects failures at both pipeline ends.
-SCP fallback is checked with a local copy stand-in. These checks require Bash,
-jq, GNU tar/gzip, coreutils, and diff; they do not verify an actual SSH server.
+SCP fallback is checked with a local copy stand-in. PTY checks cover terminal
+cleanup on success/failure and its exclusion from commands, transfers, and
+redirected sessions. These checks require Bash, jq, GNU tar/gzip, coreutils,
+diff, and util-linux `script`; they do not verify an actual SSH server.
 Use `bash sshm_exit_test.sh` to run just this regression group.
 
 The report is written to `sshm_test_report.md`; `SSHM_TEST_REPORT` overrides its
@@ -512,24 +521,24 @@ PREFIX="$HOME/.local" ./install.sh          # install without sudo into a user p
 SSHM_CONFIG_DIR="$HOME/cfg" ./install.sh    # change where the private inventory is created
 ```
 
-### Manual installation
+### Updating an existing installation
 
-Install the script:
+Use the repository and `install.sh` for binary updates. On the development
+machine, validate the change with Local QA, run `./install.sh`, and confirm that
+the installed CLI matches the source. Update the README, then commit and push
+the reviewed changes before updating another machine.
 
-```bash
-sudo install -m 0755 sshm /usr/local/bin/sshm
-```
-
-Create a private inventory outside the repository:
-
-```bash
-mkdir -p "$HOME/sshm_config"
-cp -n sshm_config/ssh_remote_default.json "$HOME/sshm_config/ssh_remote_default.json"
-chmod 600 "$HOME/sshm_config/ssh_remote_default.json"
-```
-
-Verify the installation:
+On each receiving machine, run these commands from its existing checkout:
 
 ```bash
-sshm -l
+git pull --ff-only
+./install.sh
+cmp sshm /usr/local/bin/sshm
+sshm -h
 ```
+
+For a custom `PREFIX`, compare against that prefix's `bin/sshm` instead.
+Existing private inventories are preserved by the installer. Do not distribute
+standalone binary copies between machines; each installed version should come
+from that machine's checkout. Changes take effect on the next `sshm` invocation;
+already-running SSH sessions keep the code they started with.
